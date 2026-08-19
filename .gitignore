@@ -1,0 +1,8 @@
+# fichier: .gitignore
+# À la racine, à côté de manage.py
+
+venv/
+.env
+__pycache__/
+*.pyc
+db.sqlite3

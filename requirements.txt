@@ -1,0 +1,13 @@
+﻿# fichier: requirements.txt
+# À REMPLACER ENTIÈREMENT à la racine du projet backend (à côté de manage.py)
+
+django>=5.0
+djangorestframework>=3.15
+mysqlclient>=2.2
+python-decouple>=3.8
+django-cors-headers>=4.3
+
+# --- Nouveau : nécessaire uniquement pour la production ---
+gunicorn>=22.0          # serveur WSGI de production (remplace "runserver")
+whitenoise>=6.7          # sert les fichiers statiques (admin Django) sans serveur séparé
+dj-database-url>=2.2     # lit DATABASE_URL fourni par Railway et le transforme en config Django
