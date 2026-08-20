@@ -7,5 +7,4 @@
 # web : le vrai serveur de production (gunicorn), qui remplace
 # "python manage.py runserver" utilisé en local.
 
-release: python manage.py migrate --noinput
-web: gunicorn config.wsgi --bind 0.0.0.0:8080 --log-file -
+web: python manage.py migrate --noinput && python manage.py collectstatic --noinput && gunicorn config.wsgi --bind 0.0.0.0:8080 --log-file -
