@@ -158,6 +158,11 @@ SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = 'DENY'
 
 if not DEBUG:
+    # Railway termine le TLS à son edge et transmet en HTTP en interne au
+    # conteneur — sans ce header, Django ne voit jamais une requête comme
+    # "sécurisée" et SECURE_SSL_REDIRECT boucle indéfiniment sur elle-même
+    # (redirection vers l'URL https qu'on a déjà appelée).
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
     SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=True, cast=bool)
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
