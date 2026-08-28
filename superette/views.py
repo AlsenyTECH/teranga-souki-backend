@@ -8,7 +8,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.utils import timezone
 
-from .models import Categorie, Produit, Client, Fournisseur, Service, TransactionCaisse, Approvisionnement, Depense, Role, Utilisateur
+from .models import (
+    Categorie, Produit, Client, Fournisseur, Service, TransactionCaisse, Approvisionnement,
+    Depense, Role, Utilisateur, RemboursementCredit, PaiementFournisseur,
+    SessionCaisse, StatutSession,
+)
 from .serializers import (
     CategorieSerializer, ProduitSerializer, ClientSerializer,
     FournisseurSerializer, ServiceSerializer,
@@ -17,7 +21,13 @@ from .serializers import (
     PrestationCreationSerializer, PrestationLectureSerializer,
     DepenseSerializer, RoleSerializer, UtilisateurSerializer, UtilisateurCreationSerializer,
     AjustementStockCreationSerializer, AjustementStockLectureSerializer,
-    RemboursementCreditSerializer, ModifierPermissionsSerializer, MonProfilSerializer,
+    RemboursementCreditSerializer, RemboursementCreditLectureSerializer,
+    ModifierPermissionsSerializer, MonProfilSerializer, UtilisateurEditionSerializer,
+    ArchiveCreanceClientSerializer, ArchiveCreanceFournisseurSerializer,
+    PaiementFournisseurSerializer, PaiementFournisseurLectureSerializer,
+    SessionCaisseOuvertureSerializer, SessionCaisseFermetureSerializer,
+    SessionCaisseLectureSerializer, calculer_totaux_session,
+    RetourVenteCreationSerializer, RetourVenteLectureSerializer,
 )
 from .permissions import (
     LectureAdminEcritureAdmin, EstCaissierOuAdmin, EstAdmin,
@@ -115,7 +125,15 @@ class VenteView(APIView):
         # Bonus : lister les ventes du jour, utile pour l'écran caisse
         qs = TransactionCaisse.objects.filter(
             venteproduits__isnull=False
-        ).select_related("utilisateur", "client").prefetch_related("venteproduits__lignes__produit")
+        ).select_related("utilisateur", "client").prefetch_related(
+            "venteproduits__lignes__produit", "retours__lignes", "paiements",
+        )
+        # ?client=<id> : historique des ventes d'un client précis, pour
+        # sa fiche détail (Flutter fusionne ce résultat avec ses
+        # remboursements de crédit pour construire une timeline unique).
+        client_id = request.query_params.get("client")
+        if client_id:
+            qs = qs.filter(client_id=client_id)
         serializer = TransactionCaisseLectureSerializer(qs, many=True)
         return Response(serializer.data)
 
@@ -142,6 +160,11 @@ class ApprovisionnementView(APIView):
 
     def get(self, request):
         qs = Approvisionnement.objects.select_related("fournisseur").prefetch_related("lignes__produit")
+        # ?fournisseur=<id> : historique des réceptions d'un fournisseur
+        # précis, pour sa fiche détail.
+        fournisseur_id = request.query_params.get("fournisseur")
+        if fournisseur_id:
+            qs = qs.filter(fournisseur_id=fournisseur_id)
         serializer = ApprovisionnementLectureSerializer(qs, many=True)
         return Response(serializer.data)
 
@@ -196,16 +219,23 @@ from django.db import transaction
 from .models import LigneVente, Depense as DepenseModel, AjustementStock, ModePaiement
 
 
+def evolution_pct(actuel, ancien):
+    """% d'évolution entre deux valeurs — None si pas de base de
+    comparaison valable (période précédente à 0), plutôt qu'une fausse
+    division. Partagé entre RapportJournalierView et RapportPeriodeView."""
+    actuel, ancien = float(actuel), float(ancien)
+    if ancien == 0:
+        return None
+    return round((actuel - ancien) / ancien * 100, 1)
+
+
 class RapportJournalierView(APIView):
     """
     GET /api/rapports/?date=2026-08-16   (date optionnelle, défaut = aujourd'hui)
     """
     permission_classes = [PeutVoirRapports]
 
-    def get(self, request):
-        date_param = request.query_params.get("date")
-        jour = date_cls.fromisoformat(date_param) if date_param else timezone.localdate()
-
+    def _totaux_jour(self, jour):
         transactions_du_jour = TransactionCaisse.objects.filter(
             date_heure__date=jour, annulee=False
         )
@@ -239,6 +269,25 @@ class RapportJournalierView(APIView):
             vente__transaction__annulee=False,
         ).aggregate(total=Coalesce(Sum(marge_expr), 0, output_field=DecimalField()))["total"]
 
+        chiffre_affaires = ca_ventes + ca_prestations
+        resultat_net = chiffre_affaires - total_depenses
+
+        return {
+            "chiffre_affaires_ventes": ca_ventes,
+            "chiffre_affaires_prestations": ca_prestations,
+            "chiffre_affaires_total": chiffre_affaires,
+            "marge_brute_ventes": marge_ventes,
+            "total_depenses": total_depenses,
+            "resultat_net": resultat_net,
+        }
+
+    def get(self, request):
+        date_param = request.query_params.get("date")
+        jour = date_cls.fromisoformat(date_param) if date_param else timezone.localdate()
+
+        totaux = self._totaux_jour(jour)
+        totaux_veille = self._totaux_jour(jour - timedelta(days=1))
+
         # Produits les plus vendus du jour (top 5)
         top_produits = (
             LigneVente.objects.filter(
@@ -255,19 +304,25 @@ class RapportJournalierView(APIView):
             actif=True, quantite_stock__lte=F("seuil_alerte")
         ).values("id", "nom", "quantite_stock", "seuil_alerte")
 
-        chiffre_affaires = ca_ventes + ca_prestations
-        resultat_net = chiffre_affaires - total_depenses
-
         return Response({
             "date": jour.isoformat(),
-            "chiffre_affaires_ventes": ca_ventes,
-            "chiffre_affaires_prestations": ca_prestations,
-            "chiffre_affaires_total": chiffre_affaires,
-            "marge_brute_ventes": marge_ventes,
-            "total_depenses": total_depenses,
-            "resultat_net": resultat_net,
+            **totaux,
             "top_produits": list(top_produits),
             "produits_stock_bas": list(produits_stock_bas),
+            # Comparaison avec la veille — donne un sens réel aux mini-
+            # indicateurs de variation affichés sur chaque carte KPI du
+            # tableau de bord (aucune valeur inventée : soit un vrai %,
+            # soit None si la veille n'a aucune base de comparaison).
+            "comparaison_veille": {
+                "evolution_chiffre_affaires_pct": evolution_pct(
+                    totaux["chiffre_affaires_total"], totaux_veille["chiffre_affaires_total"]),
+                "evolution_marge_brute_pct": evolution_pct(
+                    totaux["marge_brute_ventes"], totaux_veille["marge_brute_ventes"]),
+                "evolution_depenses_pct": evolution_pct(
+                    totaux["total_depenses"], totaux_veille["total_depenses"]),
+                "evolution_resultat_net_pct": evolution_pct(
+                    totaux["resultat_net"], totaux_veille["resultat_net"]),
+            },
         })
 
 
@@ -309,19 +364,19 @@ class RapportPeriodeView(APIView):
         fin_precedent = debut - timedelta(days=1)
         precedent = self._calculer(debut_precedent, fin_precedent)
 
-        def evolution_pct(actuel, ancien):
-            actuel, ancien = float(actuel), float(ancien)
-            if ancien == 0:
-                return None  # pas de base de comparaison valable
-            return round((actuel - ancien) / ancien * 100, 1)
-
         donnees["comparaison"] = {
             "chiffre_affaires_precedent": precedent["chiffre_affaires_total"],
             "resultat_net_precedent": precedent["resultat_net"],
+            "marge_brute_ventes_precedent": precedent["marge_brute_ventes"],
+            "total_depenses_precedent": precedent["total_depenses"],
             "evolution_chiffre_affaires_pct": evolution_pct(
                 donnees["chiffre_affaires_total"], precedent["chiffre_affaires_total"]),
             "evolution_resultat_net_pct": evolution_pct(
                 donnees["resultat_net"], precedent["resultat_net"]),
+            "evolution_marge_brute_pct": evolution_pct(
+                donnees["marge_brute_ventes"], precedent["marge_brute_ventes"]),
+            "evolution_depenses_pct": evolution_pct(
+                donnees["total_depenses"], precedent["total_depenses"]),
         }
 
         # Snapshots indépendants de la période choisie — l'état ACTUEL
@@ -386,6 +441,22 @@ class RapportPeriodeView(APIView):
             .order_by("-quantite_totale")[:10]
         )
 
+        # Répartition du chiffre d'affaires par catégorie de produit —
+        # matière première du graphique donut côté app (chaque Produit a
+        # une catégorie obligatoire, donc aucune ligne ne tombe hors
+        # regroupement ici, contrairement à depenses_par_categorie qui
+        # est une simple chaîne libre).
+        ventes_par_categorie = list(
+            LigneVente.objects.filter(
+                vente__transaction__date_heure__date__gte=debut,
+                vente__transaction__date_heure__date__lte=fin,
+                vente__transaction__annulee=False,
+            )
+            .values(categorie=F("produit__categorie__libelle"))
+            .annotate(chiffre_affaires=Sum(F("quantite") * F("prix_unitaire_vente")))
+            .order_by("-chiffre_affaires")
+        )
+
         # Produits actifs n'ayant fait l'objet d'AUCUNE vente sur la
         # période — signal utile pour repérer le stock qui dort.
         produits_vendus_ids = LigneVente.objects.filter(
@@ -426,6 +497,7 @@ class RapportPeriodeView(APIView):
             "resultat_net": resultat_net,
             "repartition_paiement": repartition_paiement,
             "top_produits": top_produits,
+            "ventes_par_categorie": ventes_par_categorie,
             "produits_invendus": produits_invendus,
             "depenses_par_categorie": depenses_par_categorie,
             "evolution_quotidienne": [
@@ -478,6 +550,42 @@ class UtilisateurPermissionsView(APIView):
         serializer.is_valid(raise_exception=True)
         utilisateur.permissions_supplementaires = serializer.validated_data["permissions_supplementaires"]
         utilisateur.save(update_fields=["permissions_supplementaires"])
+        return Response(UtilisateurSerializer(utilisateur).data)
+
+
+class UtilisateurDetailView(APIView):
+    """
+    PATCH /api/utilisateurs/<id>/ — un admin modifie le nom, le
+    téléphone, l'identifiant de connexion et/ou le mot de passe d'un
+    AUTRE compte. Distinct de UtilisateurPermissionsView (permissions
+    uniquement) et de MonProfilView (auto-édition) — jamais mélangés.
+    """
+    permission_classes = [EstAdmin]
+
+    def patch(self, request, pk):
+        try:
+            utilisateur = Utilisateur.objects.select_related("compte").get(pk=pk)
+        except Utilisateur.DoesNotExist:
+            return Response({"detail": "Compte introuvable."}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = UtilisateurEditionSerializer(instance=utilisateur, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        if "nom" in data:
+            utilisateur.nom = data["nom"]
+        if "telephone" in data:
+            utilisateur.telephone = data["telephone"]
+        utilisateur.save()
+
+        if "username" in data:
+            utilisateur.compte.username = data["username"]
+        nouveau_mdp = data.get("nouveau_mot_de_passe")
+        if nouveau_mdp:
+            utilisateur.compte.set_password(nouveau_mdp)
+        if "username" in data or nouveau_mdp:
+            utilisateur.compte.save()
+
         return Response(UtilisateurSerializer(utilisateur).data)
 
 
@@ -547,15 +655,20 @@ class AnnulerVenteView(APIView):
     permission_classes = [EstAdmin]
 
     def post(self, request, pk):
-        try:
-            transaction_caisse = TransactionCaisse.objects.select_for_update().get(pk=pk)
-        except TransactionCaisse.DoesNotExist:
-            return Response({"detail": "Vente introuvable."}, status=status.HTTP_404_NOT_FOUND)
-
-        if transaction_caisse.annulee:
-            return Response({"detail": "Cette vente est déjà annulée."}, status=status.HTTP_400_BAD_REQUEST)
-
+        # select_for_update() exige une transaction déjà ouverte — tout
+        # le corps de la vue doit donc être dans le bloc atomic (bug
+        # préexistant corrigé ici : ATOMIC_REQUESTS n'est pas activé dans
+        # ce projet, donc select_for_update() hors atomic() lève
+        # TransactionManagementError dès qu'on l'exerce réellement).
         with transaction.atomic():
+            try:
+                transaction_caisse = TransactionCaisse.objects.select_for_update().get(pk=pk)
+            except TransactionCaisse.DoesNotExist:
+                return Response({"detail": "Vente introuvable."}, status=status.HTTP_404_NOT_FOUND)
+
+            if transaction_caisse.annulee:
+                return Response({"detail": "Cette vente est déjà annulée."}, status=status.HTTP_400_BAD_REQUEST)
+
             vente = getattr(transaction_caisse, "venteproduits", None)
             if vente is not None:
                 # Restitution du stock ligne par ligne, avec le même
@@ -568,13 +681,41 @@ class AnnulerVenteView(APIView):
 
             transaction_caisse.annulee = True
             transaction_caisse.save(update_fields=["annulee"])
+            transaction_caisse.refresh_from_db()
 
-        transaction_caisse.refresh_from_db()
         return Response(TransactionCaisseLectureSerializer(transaction_caisse).data)
 
 
+class RetourVenteView(APIView):
+    """
+    POST /api/ventes/<id>/retour/ — retourne tout ou partie d'une vente
+    (remboursement partiel, restock). Même niveau de permission que
+    AnnulerVenteView/RemboursementCreditView : toute opération qui défait
+    de l'argent déjà encaissé est réservée à l'admin.
+    """
+    permission_classes = [EstAdmin]
+
+    def post(self, request, pk):
+        try:
+            vente = TransactionCaisse.objects.select_related("client").get(pk=pk)
+        except TransactionCaisse.DoesNotExist:
+            return Response({"detail": "Vente introuvable."}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = RetourVenteCreationSerializer(
+            data=request.data, context={"vente": vente, "utilisateur": request.user.utilisateur}
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        vente.refresh_from_db()
+        return Response(TransactionCaisseLectureSerializer(vente).data, status=status.HTTP_201_CREATED)
+
+
 class RemboursementCreditView(APIView):
-    """POST /api/remboursements-credit/ — un client rembourse (tout ou partie de) sa dette."""
+    """
+    POST /api/remboursements-credit/ — un client rembourse (tout ou partie de) sa dette.
+    GET  /api/remboursements-credit/?client=<id> — historique des remboursements
+    d'un client précis, pour sa fiche détail.
+    """
     permission_classes = [EstAdmin]
 
     def post(self, request):
@@ -585,22 +726,257 @@ class RemboursementCreditView(APIView):
         client = serializer.save()
         return Response(ClientSerializer(client).data, status=status.HTTP_201_CREATED)
 
+    def get(self, request):
+        qs = RemboursementCredit.objects.select_related("client", "utilisateur")
+        client_id = request.query_params.get("client")
+        if client_id:
+            qs = qs.filter(client_id=client_id)
+        return Response(RemboursementCreditLectureSerializer(qs, many=True).data)
+
+
+class PaiementFournisseurView(APIView):
+    """
+    POST /api/paiements-fournisseur/ — règle (tout ou partie de) la dette
+    envers un fournisseur. Miroir de RemboursementCreditView côté achats.
+    GET  /api/paiements-fournisseur/?fournisseur=<id> — historique des
+    paiements d'un fournisseur précis, pour sa fiche détail.
+    """
+    permission_classes = [EstAdmin]
+
+    def post(self, request):
+        serializer = PaiementFournisseurSerializer(
+            data=request.data, context={"utilisateur": request.user.utilisateur}
+        )
+        serializer.is_valid(raise_exception=True)
+        fournisseur = serializer.save()
+        return Response(FournisseurSerializer(fournisseur).data, status=status.HTTP_201_CREATED)
+
+    def get(self, request):
+        qs = PaiementFournisseur.objects.select_related("fournisseur", "utilisateur")
+        fournisseur_id = request.query_params.get("fournisseur")
+        if fournisseur_id:
+            qs = qs.filter(fournisseur_id=fournisseur_id)
+        return Response(PaiementFournisseurLectureSerializer(qs, many=True).data)
+
+
+from .models import ArchiveCreanceClient, ArchiveCreanceFournisseur
+
+
+class ArchiverCreanceClientView(APIView):
+    """
+    POST /api/clients/<id>/archiver-creance/ — clôt le cycle de créance
+    courant d'un client (exige solde_credit == 0 : on n'archive jamais
+    une dette encore due). Ne touche pas au solde (déjà à zéro) :
+    enregistre juste une photo horodatée des totaux du cycle qui vient
+    de se terminer, pour repartir sur une liste propre côté UI (voir
+    ArchiveCreanceClient dans models.py) sans perdre l'historique.
+    GET renvoie les cycles déjà clôturés pour ce client (le plus
+    récent en premier).
+    """
+    permission_classes = [EstAdmin]
+
+    def post(self, request, pk):
+        try:
+            client = Client.objects.get(pk=pk)
+        except Client.DoesNotExist:
+            return Response({"detail": "Client introuvable."}, status=status.HTTP_404_NOT_FOUND)
+        if client.solde_credit != 0:
+            return Response(
+                {"detail": "Le solde doit être à zéro avant d'archiver cette créance."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        derniere_archive = client.archives_creance.first()  # Meta.ordering = -date_archivage
+        depuis = derniere_archive.date_archivage if derniere_archive else None
+
+        ventes_qs = TransactionCaisse.objects.filter(client=client, annulee=False)
+        if depuis:
+            ventes_qs = ventes_qs.filter(date_heure__gt=depuis)
+
+        total_mis_a_credit = 0
+        for vente in ventes_qs:
+            if vente.mode_paiement == ModePaiement.CREDIT:
+                total_mis_a_credit += vente.montant_total
+            elif vente.mode_paiement == ModePaiement.MIXTE:
+                total_mis_a_credit += vente.paiements.filter(mode_paiement=ModePaiement.CREDIT).aggregate(
+                    total=Coalesce(Sum("montant"), 0, output_field=DecimalField())
+                )["total"]
+
+        remboursements_qs = RemboursementCredit.objects.filter(client=client)
+        if depuis:
+            remboursements_qs = remboursements_qs.filter(date_heure__gt=depuis)
+        total_rembourse = remboursements_qs.aggregate(
+            total=Coalesce(Sum("montant"), 0, output_field=DecimalField())
+        )["total"]
+
+        archive = ArchiveCreanceClient.objects.create(
+            client=client,
+            total_mis_a_credit=total_mis_a_credit,
+            total_rembourse=total_rembourse,
+            utilisateur=request.user.utilisateur,
+        )
+        return Response(ArchiveCreanceClientSerializer(archive).data, status=status.HTTP_201_CREATED)
+
+    def get(self, request, pk):
+        qs = ArchiveCreanceClient.objects.filter(client_id=pk).select_related("utilisateur")
+        return Response(ArchiveCreanceClientSerializer(qs, many=True).data)
+
+
+class ArchiverCreanceFournisseurView(APIView):
+    """Miroir de ArchiverCreanceClientView côté fournisseurs (solde_du)."""
+    permission_classes = [EstAdmin]
+
+    def post(self, request, pk):
+        try:
+            fournisseur = Fournisseur.objects.get(pk=pk)
+        except Fournisseur.DoesNotExist:
+            return Response({"detail": "Fournisseur introuvable."}, status=status.HTTP_404_NOT_FOUND)
+        if fournisseur.solde_du != 0:
+            return Response(
+                {"detail": "Le solde doit être à zéro avant d'archiver cette créance."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        derniere_archive = fournisseur.archives_creance.first()
+        depuis = derniere_archive.date_archivage if derniere_archive else None
+
+        receptions_qs = Approvisionnement.objects.filter(fournisseur=fournisseur)
+        if depuis:
+            receptions_qs = receptions_qs.filter(date_reception__gt=depuis)
+        total_recu = receptions_qs.aggregate(
+            total=Coalesce(Sum("montant_total"), 0, output_field=DecimalField())
+        )["total"]
+
+        paiements_qs = PaiementFournisseur.objects.filter(fournisseur=fournisseur)
+        if depuis:
+            paiements_qs = paiements_qs.filter(date_heure__gt=depuis)
+        total_paye = paiements_qs.aggregate(
+            total=Coalesce(Sum("montant"), 0, output_field=DecimalField())
+        )["total"]
+
+        archive = ArchiveCreanceFournisseur.objects.create(
+            fournisseur=fournisseur,
+            total_recu_a_credit=total_recu,
+            total_paye=total_paye,
+            utilisateur=request.user.utilisateur,
+        )
+        return Response(ArchiveCreanceFournisseurSerializer(archive).data, status=status.HTTP_201_CREATED)
+
+    def get(self, request, pk):
+        qs = ArchiveCreanceFournisseur.objects.filter(fournisseur_id=pk).select_related("utilisateur")
+        return Response(ArchiveCreanceFournisseurSerializer(qs, many=True).data)
+
+
+class SessionCaisseOuvrirView(APIView):
+    """POST /api/sessions-caisse/ouvrir/ — ouvre une session de caisse pour l'utilisateur connecté."""
+    permission_classes = [EstCaissierOuAdmin]
+
+    def post(self, request):
+        serializer = SessionCaisseOuvertureSerializer(
+            data=request.data, context={"utilisateur": request.user.utilisateur}
+        )
+        serializer.is_valid(raise_exception=True)
+        session = serializer.save()
+        return Response(SessionCaisseLectureSerializer(session).data, status=status.HTTP_201_CREATED)
+
+
+class SessionCaisseCouranteView(APIView):
+    """
+    GET /api/sessions-caisse/courante/ — session ouverte de l'utilisateur
+    connecté, avec ses totaux recalculés en direct. Réponse vide (204) si
+    aucune session n'est ouverte.
+    """
+    permission_classes = [EstCaissierOuAdmin]
+
+    def get(self, request):
+        session = SessionCaisse.objects.filter(
+            utilisateur=request.user.utilisateur, statut=StatutSession.OUVERTE
+        ).first()
+        if session is None:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        data = SessionCaisseLectureSerializer(session).data
+        data.update({k: str(v) for k, v in calculer_totaux_session(session).items()})
+        return Response(data)
+
+
+class SessionCaisseFermerView(APIView):
+    """
+    POST /api/sessions-caisse/<id>/fermer/ — ferme une session et fige son
+    rapport Z. Un admin peut fermer la session (oubliée) d'un autre caissier ;
+    un caissier ne peut fermer que la sienne.
+    """
+    permission_classes = [EstCaissierOuAdmin]
+
+    def post(self, request, pk):
+        # select_for_update() exige une transaction déjà ouverte — tout
+        # le corps de la vue doit donc être dans le bloc atomic, pas
+        # seulement la partie qui appelle .save().
+        with transaction.atomic():
+            try:
+                session = SessionCaisse.objects.select_for_update().get(pk=pk)
+            except SessionCaisse.DoesNotExist:
+                return Response({"detail": "Session introuvable."}, status=status.HTTP_404_NOT_FOUND)
+
+            est_admin = request.user.utilisateur.role_id == "admin"
+            if not est_admin and session.utilisateur_id != request.user.utilisateur.id:
+                return Response({"detail": "Ce n'est pas ta session de caisse."}, status=status.HTTP_403_FORBIDDEN)
+            if session.statut == StatutSession.FERMEE:
+                return Response({"detail": "Cette session est déjà fermée."}, status=status.HTTP_400_BAD_REQUEST)
+
+            serializer = SessionCaisseFermetureSerializer(session, data=request.data)
+            serializer.is_valid(raise_exception=True)
+            session = serializer.save()
+        return Response(SessionCaisseLectureSerializer(session).data)
+
+
+class SessionCaisseListView(APIView):
+    """
+    GET /api/sessions-caisse/ — historique des sessions. Un caissier ne voit
+    que les siennes ; un admin voit tout (filtrable par ?utilisateur=<id>).
+    """
+    permission_classes = [EstCaissierOuAdmin]
+
+    def get(self, request):
+        qs = SessionCaisse.objects.select_related("utilisateur").order_by("-date_ouverture")
+        est_admin = request.user.utilisateur.role_id == "admin"
+        if est_admin:
+            utilisateur_id = request.query_params.get("utilisateur")
+            if utilisateur_id:
+                qs = qs.filter(utilisateur_id=utilisateur_id)
+        else:
+            qs = qs.filter(utilisateur=request.user.utilisateur)
+        return Response(SessionCaisseLectureSerializer(qs, many=True).data)
+
+
+from rest_framework.throttling import ScopedRateThrottle
+from django.conf import settings
+
 
 class ConnexionView(ObtainAuthToken):
     """
     Endpoint de connexion : POST /api/connexion/ avec {username, password}
-    renvoie un token + quelques infos utiles pour que Flutter sache
-    tout de suite à qui il parle (rôle, nom) sans requête supplémentaire.
+    renvoie un token + les infos du compte (rôle, nom, permissions).
+    Protégé par rate limiting (anti brute-force) et renouvellement automatique
+    des jetons expirés.
     """
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'connexion'
 
     def post(self, request, *args, **kwargs):
         serializer = self.serializer_class(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         user = serializer.validated_data["user"]
-        token, _ = Token.objects.get_or_create(user=user)
+
+        token, created = Token.objects.get_or_create(user=user)
+        expire_days = getattr(settings, 'TOKEN_EXPIRE_DAYS', 14)
+        if not created and token.created < timezone.now() - timedelta(days=expire_days):
+            token.delete()
+            token = Token.objects.create(user=user)
+
         utilisateur = getattr(user, "utilisateur", None)
         return Response({
             "token": token.key,
             "nom": utilisateur.nom if utilisateur else user.username,
             "role": utilisateur.role_id if utilisateur else None,
+            "permissions_supplementaires": utilisateur.permissions_supplementaires if utilisateur else [],
         })

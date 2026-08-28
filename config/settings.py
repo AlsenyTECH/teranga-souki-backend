@@ -106,7 +106,20 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 LANGUAGE_CODE = 'fr-fr'
-TIME_ZONE = 'Africa/Dakar'
+# 'Africa/Dakar' est UTC+0 toute l'année (pas d'heure d'été) — donc
+# identique à 'UTC' pour toute logique métier. On force 'UTC' ici parce
+# que MySQL a besoin de ses tables de fuseaux horaires (mysql.time_zone*)
+# pour résoudre un nom comme 'Africa/Dakar' dans CONVERT_TZ(), et ces
+# tables ne sont PAS chargées par défaut (constaté sur cette installation
+# WAMP : mysql.time_zone_name est vide). Sans ça, CONVERT_TZ() renvoie
+# NULL pour toute ligne, et TOUT filtre Django sur une date de champ
+# datetime (date_heure__date=..., __gte, __lte — utilisés dans les
+# rapports) silencieusement ne matche plus rien, sans la moindre erreur.
+# 'UTC' est le seul fuseau que Django ne convertit jamais côté SQL
+# (la donnée est déjà stockée en UTC quand USE_TZ=True), donc ce bug ne
+# peut pas se reproduire, sur aucun serveur MySQL, avec ou sans tables
+# de fuseaux chargées.
+TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
 
@@ -118,24 +131,46 @@ STORAGES = {
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+TOKEN_EXPIRE_DAYS = config('TOKEN_EXPIRE_DAYS', default=14, cast=int)
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework.authentication.TokenAuthentication',
+        'superette.authentication.ExpiringTokenAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
     ],
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '60/minute',
+        'user': '300/minute',
+        'connexion': '10/minute',
+    },
+    'DEFAULT_PAGINATION_CLASS': 'superette.pagination.StandardPagination',
 }
+
+# --- Sécurité HTTP & Navigateurs ---
+SECURE_BROWSER_XSS_FILTER = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = 'DENY'
+
+if not DEBUG:
+    SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=True, cast=bool)
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = 31536000
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
 
 # --- CORS ---
 # En local (DEBUG=True) : tout autorisé, comme avant, pour ne rien
 # changer à ton confort de développement.
 # En production (DEBUG=False) : SEULS les domaines listés dans
 # CORS_ALLOWED_ORIGINS (variable d'environnement, à définir sur
-# Railway avec l'adresse Firebase de ton app) peuvent appeler l'API —
-# c'est le correctif de sécurité qu'on avait repéré et mis de côté
-# quand on a construit l'app ("ne jamais laisser CORS_ALLOW_ALL_ORIGINS
-# = True en production").
+# Railway avec l'adresse Firebase de ton app) peuvent appeler l'API.
 if DEBUG:
     CORS_ALLOW_ALL_ORIGINS = True
 else:

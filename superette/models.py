@@ -71,6 +71,19 @@ class Produit(models.Model):
         max_digits=10, decimal_places=2,
         validators=[MinValueValidator(0)]
     )
+    # NOUVEAU : vente en gros — les deux champs sont nuls ensemble
+    # (produit vendu uniquement au détail) ou renseignés ensemble
+    # (à partir de seuil_gros unités/kg, prix_vente_gros s'applique
+    # automatiquement à la caisse). Configuré une fois ici plutôt que
+    # laissé à l'appréciation du caissier au moment de la vente.
+    prix_vente_gros = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True,
+        validators=[MinValueValidator(0)]
+    )
+    seuil_gros = models.DecimalField(
+        max_digits=10, decimal_places=3, null=True, blank=True,
+        validators=[MinValueValidator(0.001)]
+    )
     # NOUVEAU : distingue les produits vendus à l'unité (Coca, savon...)
     # de ceux vendus au poids (pomme de terre, blanc de poulet...).
     unite_vente = models.CharField(max_length=10, choices=UniteVente.choices, default=UniteVente.UNITE)
@@ -108,6 +121,12 @@ class Client(models.Model):
 class Fournisseur(models.Model):
     nom = models.CharField(max_length=100)
     contact = models.CharField(max_length=100, blank=True)
+    # NOUVEAU : miroir de Client.solde_credit, côté achats — montant que
+    # la superette doit encore à ce fournisseur (réceptions à crédit ou
+    # partiellement payées). Jamais modifiable en écriture directe via
+    # l'API : évolue uniquement via ApprovisionnementCreationSerializer
+    # et PaiementFournisseurSerializer.
+    solde_du = models.DecimalField(max_digits=10, decimal_places=2, default=0)
 
     def __str__(self):
         return self.nom
@@ -121,6 +140,36 @@ class Service(models.Model):
         return self.libelle
 
 
+class StatutSession(models.TextChoices):
+    OUVERTE = "ouverte", "Ouverte"
+    FERMEE = "fermee", "Fermée"
+
+
+class SessionCaisse(models.Model):
+    # Une session = le temps entre l'ouverture et la fermeture de la caisse
+    # par un caissier (généralement une journée/un service). Sert à
+    # rattacher les ventes/prestations réglées en espèces à un fond de
+    # caisse compté physiquement, pour produire un rapport Z à la fermeture.
+    utilisateur = models.ForeignKey(Utilisateur, on_delete=models.PROTECT, related_name="sessions_caisse")
+    date_ouverture = models.DateTimeField(auto_now_add=True)
+    fond_ouverture = models.DecimalField(max_digits=10, decimal_places=2, default=0, validators=[MinValueValidator(0)])
+    date_fermeture = models.DateTimeField(null=True, blank=True)
+    montant_compte = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, validators=[MinValueValidator(0)])
+    # montant_attendu/ecart sont calculés UNE FOIS à la fermeture puis
+    # figés (comme Approvisionnement.montant_total) — jamais recalculés
+    # après coup, même si une donnée liée changeait ensuite.
+    montant_attendu = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    ecart = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    statut = models.CharField(max_length=10, choices=StatutSession.choices, default=StatutSession.OUVERTE)
+    commentaire_fermeture = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["utilisateur", "statut"])]
+
+    def __str__(self):
+        return f"Session #{self.pk} - {self.utilisateur} ({self.statut})"
+
+
 class ModePaiement(models.TextChoices):
     # models.TextChoices = équivalent Django de l'ENUM SQL.
     # Chaque ligne : (valeur_stockée_en_base, libelle_affiché)
@@ -132,6 +181,12 @@ class ModePaiement(models.TextChoices):
     # rembourser plus tard. Exige un client identifié (jamais anonyme,
     # sinon personne à qui réclamer la dette).
     CREDIT = "credit", "Crédit client"
+    # NOUVEAU : le total est réparti sur plusieurs lignes de paiement
+    # (PaiementVente), potentiellement de modes différents (ex: moitié
+    # espèces, moitié à crédit) — jamais utilisé comme mode d'une LIGNE
+    # de paiement elle-même, seulement comme mode de la transaction
+    # globale quand elle est ainsi scindée.
+    MIXTE = "mixte", "Paiement mixte"
 
 
 class TransactionCaisse(models.Model):
@@ -144,6 +199,13 @@ class TransactionCaisse(models.Model):
     # null=True -> le champ peut être vide en base (vente anonyme)
     client = models.ForeignKey(Client, on_delete=models.SET_NULL, null=True, blank=True)
     annulee = models.BooleanField(default=False)
+    # NOUVEAU : nullable car les transactions déjà enregistrées avant
+    # l'introduction des sessions n'en ont pas. Toute NOUVELLE vente/
+    # prestation doit obligatoirement en avoir une (voir
+    # VenteCreationSerializer/PrestationCreationSerializer).
+    session_caisse = models.ForeignKey(
+        SessionCaisse, on_delete=models.PROTECT, null=True, blank=True, related_name="transactions"
+    )
 
     class Meta:
         indexes = [models.Index(fields=["date_heure"])]  # traduit notre INDEX idx_transaction_date
@@ -159,9 +221,32 @@ class VenteProduits(models.Model):
     transaction = models.OneToOneField(
         TransactionCaisse, on_delete=models.CASCADE, primary_key=True
     )
+    # NOUVEAU : réduction accordée sur cette vente, en montant (F).
+    # Gardée ici (pas sur TransactionCaisse) car propre à la vente de
+    # produits — TransactionCaisse.montant_total reste le montant déjà
+    # remisé, réellement encaissé (contrat inchangé pour les points
+    # fidélité et le crédit, qui continuent de lire montant_total).
+    reduction_montant = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0,
+        validators=[MinValueValidator(0)]
+    )
 
     def __str__(self):
         return f"Vente #{self.transaction_id}"
+
+
+class PaiementVente(models.Model):
+    # Détail d'un paiement mixte : une vente à mode_paiement="mixte" a
+    # plusieurs lignes ici dont la somme égale son montant_total. Une
+    # vente en mode simple (especes/wave/orange_money/credit) n'en a
+    # aucune — tout reste lisible directement sur TransactionCaisse.
+    vente = models.ForeignKey(TransactionCaisse, on_delete=models.CASCADE, related_name="paiements")
+    # Jamais "mixte" ici — uniquement les modes "simples" de ModePaiement.
+    mode_paiement = models.CharField(max_length=20, choices=ModePaiement.choices)
+    montant = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0.01)])
+
+    def __str__(self):
+        return f"{self.montant} F ({self.mode_paiement}) sur vente #{self.vente_id}"
 
 
 class PrestationService(models.Model):
@@ -187,6 +272,53 @@ class LigneVente(models.Model):
         return f"{self.quantite} x {self.produit}"
 
 
+# ============================================================
+# Retour produit / remboursement partiel — retourne tout ou partie
+# d'une ligne de vente déjà enregistrée. Ne modifie JAMAIS
+# TransactionCaisse.montant_total (intégrité historique) : le montant
+# "net" se calcule à la lecture (montant_total - Σ retours).
+# ============================================================
+
+class RetourVente(models.Model):
+    vente = models.ForeignKey(TransactionCaisse, on_delete=models.PROTECT, related_name="retours")
+    # Toujours la session OUVERTE de la personne qui fait le retour —
+    # jamais celle de la vente d'origine : l'argent sort de la caisse
+    # d'aujourd'hui, pas de celle du jour de la vente. Non-nullable :
+    # contrairement à TransactionCaisse.session_caisse, ce modèle est
+    # nouveau et n'a aucune ligne historique à tolérer sans session.
+    session_caisse = models.ForeignKey(SessionCaisse, on_delete=models.PROTECT, related_name="retours")
+    utilisateur = models.ForeignKey(Utilisateur, on_delete=models.PROTECT)
+    date_heure = models.DateTimeField(auto_now_add=True)
+    montant_total = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0.01)])
+    # true si ce retour doit être décompté des espèces attendues dans le
+    # rapport Z de la session — vrai pour une vente en espèces, faux
+    # pour Wave/Orange/crédit (le remboursement se fait alors ailleurs
+    # que dans le tiroir-caisse physique).
+    affecte_caisse = models.BooleanField(default=False)
+    commentaire = models.CharField(max_length=255, blank=True)
+
+    def __str__(self):
+        return f"Retour #{self.pk} sur vente #{self.vente_id} - {self.montant_total} F"
+
+
+class LigneRetour(models.Model):
+    retour = models.ForeignKey(RetourVente, on_delete=models.CASCADE, related_name="lignes")
+    ligne_vente = models.ForeignKey(LigneVente, on_delete=models.PROTECT, related_name="retours")
+    quantite = models.DecimalField(max_digits=10, decimal_places=3, validators=[MinValueValidator(0.001)])
+
+    def __str__(self):
+        return f"{self.quantite} x {self.ligne_vente.produit} (retour)"
+
+
+class ModePaiementAppro(models.TextChoices):
+    # Distinct de ModePaiement (especes/wave/orange_money/credit) : ce
+    # sont deux domaines différents — un client paie AVEC un moyen, un
+    # fournisseur est payé SELON une modalité (tout/partiel/rien).
+    COMPTANT = "comptant", "Comptant"
+    TRANCHE = "tranche", "Tranche (paiement partiel)"
+    CREDIT = "credit", "Crédit fournisseur"
+
+
 class Approvisionnement(models.Model):
     date_reception = models.DateTimeField(auto_now_add=True)
     fournisseur = models.ForeignKey(Fournisseur, on_delete=models.PROTECT)
@@ -196,6 +328,18 @@ class Approvisionnement(models.Model):
     # cas de contrôle ou de litige. Optionnel : certains petits
     # fournisseurs informels n'émettent pas toujours de facture numérotée.
     numero_facture = models.CharField(max_length=50, blank=True)
+    # NOUVEAU : jusqu'ici jamais stocké, uniquement recalculé à la volée
+    # côté Flutter à partir des lignes — indispensable maintenant pour
+    # calculer montant_du = montant_total - montant_paye de façon stable.
+    montant_total = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0, validators=[MinValueValidator(0)]
+    )
+    mode_paiement = models.CharField(
+        max_length=20, choices=ModePaiementAppro.choices, default=ModePaiementAppro.COMPTANT
+    )
+    montant_paye = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0, validators=[MinValueValidator(0)]
+    )
 
     def __str__(self):
         return f"Appro #{self.pk} - {self.fournisseur}"
@@ -290,3 +434,59 @@ class RemboursementCredit(models.Model):
 
     def __str__(self):
         return f"{self.client} rembourse {self.montant} F"
+
+
+# ============================================================
+# Paiement fournisseur — miroir de RemboursementCredit côté achats :
+# quand la superette règle tout ou partie de ce qu'elle doit à un
+# fournisseur (Fournisseur.solde_du), typiquement après une réception
+# reçue en tranche ou à crédit.
+# ============================================================
+
+class PaiementFournisseur(models.Model):
+    fournisseur = models.ForeignKey(Fournisseur, on_delete=models.PROTECT)
+    montant = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0.01)])
+    utilisateur = models.ForeignKey(Utilisateur, on_delete=models.PROTECT)
+    date_heure = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Paiement à {self.fournisseur} de {self.montant} F"
+
+
+# ============================================================
+# Archivage de créance — un admin peut "clore" le cycle de dette
+# courant d'un client/fournisseur UNE FOIS SON SOLDE À ZÉRO, pour
+# repartir sur une liste propre (l'historique détaillé du cycle clos
+# reste consultable, juste sorti de la vue "en cours"). Ce n'est PAS
+# une remise à zéro du solde (déjà à zéro par construction — la vue
+# empêche d'archiver sinon) : juste une photo horodatée + une borne de
+# date, utilisée pour partitionner ventes/réceptions passées entre
+# "avant" (archivé) et "après" (cycle courant).
+# ============================================================
+
+class ArchiveCreanceClient(models.Model):
+    client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name="archives_creance")
+    date_archivage = models.DateTimeField(auto_now_add=True)
+    total_mis_a_credit = models.DecimalField(max_digits=10, decimal_places=2)
+    total_rembourse = models.DecimalField(max_digits=10, decimal_places=2)
+    utilisateur = models.ForeignKey(Utilisateur, on_delete=models.PROTECT)
+
+    class Meta:
+        ordering = ["-date_archivage"]
+
+    def __str__(self):
+        return f"Créance {self.client} archivée le {self.date_archivage:%Y-%m-%d}"
+
+
+class ArchiveCreanceFournisseur(models.Model):
+    fournisseur = models.ForeignKey(Fournisseur, on_delete=models.CASCADE, related_name="archives_creance")
+    date_archivage = models.DateTimeField(auto_now_add=True)
+    total_recu_a_credit = models.DecimalField(max_digits=10, decimal_places=2)
+    total_paye = models.DecimalField(max_digits=10, decimal_places=2)
+    utilisateur = models.ForeignKey(Utilisateur, on_delete=models.PROTECT)
+
+    class Meta:
+        ordering = ["-date_archivage"]
+
+    def __str__(self):
+        return f"Créance {self.fournisseur} archivée le {self.date_archivage:%Y-%m-%d}"

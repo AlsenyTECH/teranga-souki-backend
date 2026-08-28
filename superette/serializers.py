@@ -1,6 +1,7 @@
 # fichier: superette/serializers.py
 # Fichier À CRÉER (n'existe pas encore dans superette/) — n'existe pas par défaut
 
+from decimal import Decimal
 from rest_framework import serializers
 from .models import (
     Role, Utilisateur, Categorie, Produit, Client, Fournisseur, Service, Depense,
@@ -14,12 +15,17 @@ class RoleSerializer(serializers.ModelSerializer):
 
 
 class UtilisateurSerializer(serializers.ModelSerializer):
+    # Lecture seule : l'identifiant de connexion vit sur compte.username
+    # (le User Django), pas sur Utilisateur — exposé ici pour que l'admin
+    # puisse le voir avant de le modifier (UtilisateurEditionSerializer).
+    username = serializers.CharField(source="compte.username", read_only=True)
+
     class Meta:
         model = Utilisateur
         # Liste EXPLICITE des champs exposés — jamais fields = "__all__"
         # sur un modèle contenant un mot de passe : mot_de_passe_hash
         # ne doit JAMAIS apparaître dans une réponse JSON.
-        fields = ["id", "nom", "telephone", "role", "actif", "date_creation", "permissions_supplementaires"]
+        fields = ["id", "nom", "telephone", "username", "role", "actif", "date_creation", "permissions_supplementaires"]
         read_only_fields = ["date_creation"]
 
 
@@ -42,6 +48,7 @@ class ProduitSerializer(serializers.ModelSerializer):
         model = Produit
         fields = [
             "id", "nom", "code_barre", "prix_achat_moyen", "prix_vente",
+            "prix_vente_gros", "seuil_gros",
             "unite_vente", "quantite_stock", "seuil_alerte", "categorie", "categorie_nom",
             "actif", "stock_bas",
         ]
@@ -61,6 +68,17 @@ class ProduitSerializer(serializers.ModelSerializer):
         if value <= 0:
             raise serializers.ValidationError("Le prix de vente doit être strictement positif.")
         return value
+
+    def validate(self, data):
+        # prix_vente_gros et seuil_gros vont toujours ensemble : soit le
+        # produit n'a pas de palier de gros, soit il a les deux valeurs.
+        prix_gros = data.get("prix_vente_gros", getattr(self.instance, "prix_vente_gros", None))
+        seuil_gros = data.get("seuil_gros", getattr(self.instance, "seuil_gros", None))
+        if (prix_gros is None) != (seuil_gros is None):
+            raise serializers.ValidationError(
+                "Le prix de gros et le seuil de quantité doivent être renseignés ensemble."
+            )
+        return data
 
 
 class ClientSerializer(serializers.ModelSerializer):
@@ -91,7 +109,10 @@ class DepenseSerializer(serializers.ModelSerializer):
 class FournisseurSerializer(serializers.ModelSerializer):
     class Meta:
         model = Fournisseur
-        fields = ["id", "nom", "contact"]
+        fields = ["id", "nom", "contact", "solde_du"]
+        # Même règle que Client.solde_credit : jamais modifiable en
+        # écriture directe, uniquement via les réceptions et paiements.
+        read_only_fields = ["solde_du"]
 
 
 class ServiceSerializer(serializers.ModelSerializer):
@@ -107,8 +128,8 @@ class ServiceSerializer(serializers.ModelSerializer):
 # ============================================================
 
 from django.db import transaction
-from django.db.models import F
-from .models import TransactionCaisse, VenteProduits, LigneVente
+from django.db.models import F, Sum
+from .models import TransactionCaisse, VenteProduits, LigneVente, SessionCaisse, StatutSession, PaiementVente
 
 
 class LigneVenteEcritureSerializer(serializers.Serializer):
@@ -118,15 +139,9 @@ class LigneVenteEcritureSerializer(serializers.Serializer):
     # dans VenteCreationSerializer.create(), où on a besoin de vérifier
     # le stock avant de créer quoi que ce soit.
     produit = serializers.PrimaryKeyRelatedField(queryset=Produit.objects.filter(actif=True))
-    # DecimalField, pas IntegerField : un produit vendu au poids envoie
-    # une quantité fractionnaire (0.750 kg), un produit à l'unité
-    # envoie un entier (2) — même champ, deux usages naturels.
-    quantite = serializers.DecimalField(max_digits=10, decimal_places=3, min_value=0.001)
-    # prix_unitaire_vente optionnel : si absent, on utilise le prix
-    # catalogue du produit (cas normal). S'il est fourni, ça permet
-    # une remise ponctuelle décidée par l'admin/caissier.
+    quantite = serializers.DecimalField(max_digits=10, decimal_places=3, min_value=Decimal("0.001"))
     prix_unitaire_vente = serializers.DecimalField(
-        max_digits=10, decimal_places=2, min_value=0, required=False
+        max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False
     )
 
 
@@ -135,10 +150,27 @@ class LigneVenteLectureSerializer(serializers.ModelSerializer):
     # Propagé jusqu'au reçu/à l'historique : sans ça, le frontend ne
     # peut pas savoir s'il doit afficher "2" ou "0.750 kg".
     produit_unite_vente = serializers.CharField(source="produit.unite_vente", read_only=True)
+    quantite_retournee = serializers.SerializerMethodField()
+    quantite_restante = serializers.SerializerMethodField()
 
     class Meta:
         model = LigneVente
-        fields = ["id", "produit", "produit_nom", "produit_unite_vente", "quantite", "prix_unitaire_vente"]
+        fields = [
+            "id", "produit", "produit_nom", "produit_unite_vente", "quantite", "prix_unitaire_vente",
+            "quantite_retournee", "quantite_restante",
+        ]
+
+    def get_quantite_retournee(self, obj):
+        return obj.retours.aggregate(total=Sum("quantite"))["total"] or Decimal("0")
+
+    def get_quantite_restante(self, obj):
+        return obj.quantite - self.get_quantite_retournee(obj)
+
+
+class PaiementVenteEcritureSerializer(serializers.Serializer):
+    # Jamais "mixte" au niveau d'une ligne — seulement les modes simples.
+    mode_paiement = serializers.ChoiceField(choices=["especes", "wave", "orange_money", "credit"])
+    montant = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0.01"))
 
 
 class VenteCreationSerializer(serializers.Serializer):
@@ -153,12 +185,30 @@ class VenteCreationSerializer(serializers.Serializer):
         {"produit": 5, "quantite": 1, "prix_unitaire_vente": "500.00"}
       ]
     }
+
+    Paiement mixte (le total est réparti sur plusieurs lignes) :
+    {
+      "mode_paiement": "mixte",
+      "client": 7,
+      "paiements": [
+        {"mode_paiement": "especes", "montant": "5000.00"},
+        {"mode_paiement": "credit", "montant": "3000.00"}
+      ],
+      "lignes": [...]
+    }
     """
     client = serializers.PrimaryKeyRelatedField(
         queryset=Client.objects.all(), required=False, allow_null=True
     )
-    mode_paiement = serializers.ChoiceField(choices=["especes", "wave", "orange_money", "credit"])
+    mode_paiement = serializers.ChoiceField(choices=["especes", "wave", "orange_money", "credit", "mixte"])
     lignes = LigneVenteEcritureSerializer(many=True)
+    # Réduction sur le total de la vente (montant, pas pourcentage — le
+    # frontend calcule déjà un éventuel pourcentage en montant avant
+    # l'envoi, pour que le serveur n'ait qu'une seule règle à valider).
+    reduction_montant = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False
+    )
+    paiements = PaiementVenteEcritureSerializer(many=True, required=False)
 
     def validate_lignes(self, value):
         if not value:
@@ -166,13 +216,50 @@ class VenteCreationSerializer(serializers.Serializer):
         return value
 
     def validate(self, data):
-        # Une vente à crédit doit pouvoir être réclamée à quelqu'un —
-        # impossible de la laisser anonyme, contrairement aux autres
-        # modes de paiement où l'anonymat est un choix légitime.
+        # Une vente à crédit (simple ou la part crédit d'un paiement
+        # mixte) doit pouvoir être réclamée à quelqu'un — impossible de
+        # la laisser anonyme, contrairement aux autres modes où
+        # l'anonymat est un choix légitime.
         if data.get("mode_paiement") == "credit" and not data.get("client"):
             raise serializers.ValidationError(
                 "Une vente à crédit doit être attribuée à un client identifié (pas anonyme)."
             )
+
+        paiements = data.get("paiements")
+        if data.get("mode_paiement") == "mixte":
+            if not paiements or len(paiements) < 2:
+                raise serializers.ValidationError(
+                    "Un paiement mixte doit contenir au moins deux lignes — utilise directement "
+                    "le mode correspondant pour un paiement simple."
+                )
+            lignes_credit = [p for p in paiements if p["mode_paiement"] == "credit"]
+            if len(lignes_credit) > 1:
+                raise serializers.ValidationError("Un paiement mixte ne peut avoir qu'une seule part à crédit.")
+            if lignes_credit and not data.get("client"):
+                raise serializers.ValidationError(
+                    "La part à crédit d'un paiement mixte doit être attribuée à un client identifié."
+                )
+        elif paiements:
+            raise serializers.ValidationError(
+                "\"paiements\" ne s'utilise qu'avec mode_paiement=\"mixte\"."
+            )
+
+        reduction = data.get("reduction_montant") or Decimal("0")
+        sous_total = sum(
+            (ligne.get("prix_unitaire_vente") or ligne["produit"].prix_vente) * ligne["quantite"]
+            for ligne in data.get("lignes", [])
+        )
+        if reduction > 0 and reduction > sous_total:
+            raise serializers.ValidationError("La réduction dépasse le sous-total de la vente.")
+
+        if paiements:
+            total_paiements = sum(p["montant"] for p in paiements)
+            total_attendu = sous_total - reduction
+            if abs(total_paiements - total_attendu) > Decimal("0.01"):
+                raise serializers.ValidationError(
+                    f"La somme des paiements ({total_paiements} F) ne correspond pas "
+                    f"au total de la vente ({total_attendu} F)."
+                )
         return data
 
     def create(self, validated_data):
@@ -183,6 +270,18 @@ class VenteCreationSerializer(serializers.Serializer):
         # tout est annulé (rollback) au moindre problème — y compris
         # si une exception Python est levée n'importe où dans le bloc.
         with transaction.atomic():
+            # Toute vente doit être rattachée à une session de caisse
+            # ouverte — c'est ce qui permet de produire un rapport Z
+            # fiable à la fermeture (voir SessionCaisse). Vérifié ici,
+            # au tout début du bloc atomic, avant tout verrou produit.
+            session = SessionCaisse.objects.filter(
+                utilisateur=utilisateur, statut=StatutSession.OUVERTE
+            ).first()
+            if session is None:
+                raise serializers.ValidationError(
+                    "Aucune session de caisse ouverte — ouvre la caisse avant d'enregistrer une vente."
+                )
+
             montant_total = 0
             lignes_pretes = []
 
@@ -207,13 +306,36 @@ class VenteCreationSerializer(serializers.Serializer):
                 montant_total += prix * ligne["quantite"]
                 lignes_pretes.append((produit, ligne["quantite"], prix))
 
+            # La réduction est soustraite AVANT de créer la transaction :
+            # montant_total doit toujours refléter ce qui est réellement
+            # encaissé, puisque les points fidélité et l'incrément du
+            # solde crédit (plus bas) se basent dessus.
+            reduction = validated_data.get("reduction_montant") or Decimal("0")
+            montant_total -= reduction
+
             transaction_caisse = TransactionCaisse.objects.create(
                 montant_total=montant_total,
                 mode_paiement=validated_data["mode_paiement"],
                 utilisateur=utilisateur,
                 client=validated_data.get("client"),
+                session_caisse=session,
             )
-            vente = VenteProduits.objects.create(transaction=transaction_caisse)
+            vente = VenteProduits.objects.create(
+                transaction=transaction_caisse, reduction_montant=reduction
+            )
+
+            # Paiement mixte : une ligne PaiementVente par mode déclaré.
+            # validate() a déjà vérifié que leur somme == montant_total.
+            paiements_data = validated_data.get("paiements") or []
+            montant_credit = Decimal("0")
+            for paiement in paiements_data:
+                PaiementVente.objects.create(
+                    vente=transaction_caisse,
+                    mode_paiement=paiement["mode_paiement"],
+                    montant=paiement["montant"],
+                )
+                if paiement["mode_paiement"] == "credit":
+                    montant_credit = paiement["montant"]
 
             for produit, quantite, prix in lignes_pretes:
                 LigneVente.objects.create(
@@ -244,12 +366,22 @@ class VenteCreationSerializer(serializers.Serializer):
                 # Vente à crédit : rien n'est encaissé maintenant, le
                 # montant s'ajoute à la dette du client au lieu d'un
                 # paiement réel — remboursable plus tard (voir
-                # RemboursementCreditSerializer plus bas).
+                # RemboursementCreditSerializer plus bas). En paiement
+                # mixte, seule LA PART à crédit (pas le total) s'ajoute.
                 if validated_data["mode_paiement"] == "credit":
                     client.solde_credit = F("solde_credit") + montant_total
                     client.save(update_fields=["solde_credit"])
+                elif validated_data["mode_paiement"] == "mixte" and montant_credit > 0:
+                    client.solde_credit = F("solde_credit") + montant_credit
+                    client.save(update_fields=["solde_credit"])
 
             return transaction_caisse
+
+
+class PaiementVenteLectureSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaiementVente
+        fields = ["id", "mode_paiement", "montant"]
 
 
 class TransactionCaisseLectureSerializer(serializers.ModelSerializer):
@@ -260,12 +392,19 @@ class TransactionCaisseLectureSerializer(serializers.ModelSerializer):
     # évite une AttributeError quand la vente est anonyme (client=None).
     client_telephone = serializers.SerializerMethodField()
     client_adresse = serializers.SerializerMethodField()
+    reduction_montant = serializers.SerializerMethodField()
+    sous_total = serializers.SerializerMethodField()
+    montant_retourne = serializers.SerializerMethodField()
+    montant_net = serializers.SerializerMethodField()
+    # Liste vide pour toute vente non-mixte — champ additif.
+    paiements = PaiementVenteLectureSerializer(many=True, read_only=True)
 
     class Meta:
         model = TransactionCaisse
         fields = [
             "id", "date_heure", "montant_total", "mode_paiement",
             "caissier_nom", "client_nom", "client_telephone", "client_adresse", "annulee", "lignes",
+            "reduction_montant", "sous_total", "montant_retourne", "montant_net", "paiements",
         ]
 
     def get_client_telephone(self, obj):
@@ -274,6 +413,176 @@ class TransactionCaisseLectureSerializer(serializers.ModelSerializer):
     def get_client_adresse(self, obj):
         return obj.client.adresse if obj.client else None
 
+    def get_reduction_montant(self, obj):
+        vente = getattr(obj, "venteproduits", None)
+        montant = vente.reduction_montant if vente else Decimal("0")
+        return montant.quantize(Decimal("0.01"))
+
+    def get_montant_retourne(self, obj):
+        total = obj.retours.aggregate(total=Sum("montant_total"))["total"] or Decimal("0")
+        return total.quantize(Decimal("0.01"))
+
+    def get_montant_net(self, obj):
+        return (obj.montant_total - self.get_montant_retourne(obj)).quantize(Decimal("0.01"))
+
+    def get_sous_total(self, obj):
+        # obj.montant_total peut porter plus de 2 décimales en mémoire
+        # (Decimal(2dp) * Decimal(3dp) = 5dp, jamais réarrondi tant que
+        # l'objet n'est pas relu depuis la base) — quantize() ici évite
+        # de propager ce bruit de précision dans un champ affiché tel quel.
+        total = obj.montant_total + self.get_reduction_montant(obj)
+        return total.quantize(Decimal("0.01"))
+
+
+# ============================================================
+# Retour produit / remboursement partiel — retourne tout ou partie
+# d'une ligne de vente déjà enregistrée. Ne modifie jamais
+# TransactionCaisse.montant_total ; montant_net se calcule à la lecture.
+# ============================================================
+
+from .models import RetourVente, LigneRetour
+
+
+class LigneRetourEcritureSerializer(serializers.Serializer):
+    ligne_vente = serializers.PrimaryKeyRelatedField(queryset=LigneVente.objects.all())
+    quantite = serializers.DecimalField(max_digits=10, decimal_places=3, min_value=Decimal("0.001"))
+
+
+class RetourVenteCreationSerializer(serializers.Serializer):
+    """
+    POST /api/ventes/<id>/retour/
+    {
+      "lignes": [{"ligne_vente": 45, "quantite": 1}],
+      "rembourser_en_especes": false,
+      "commentaire": "Produit périmé"
+    }
+    Le contexte doit fournir "vente" (la TransactionCaisse déjà verrouillée
+    par la vue) et "utilisateur".
+    """
+    lignes = LigneRetourEcritureSerializer(many=True)
+    rembourser_en_especes = serializers.BooleanField(required=False, default=False)
+    commentaire = serializers.CharField(required=False, allow_blank=True, max_length=255)
+
+    def validate_lignes(self, value):
+        if not value:
+            raise serializers.ValidationError("Un retour doit contenir au moins une ligne.")
+        return value
+
+    def validate(self, data):
+        vente = self.context["vente"]
+        if vente.annulee:
+            raise serializers.ValidationError("Cette vente est annulée, aucun retour n'est possible.")
+        venteproduits = getattr(vente, "venteproduits", None)
+        if venteproduits is None:
+            raise serializers.ValidationError("Les retours ne s'appliquent qu'aux ventes de produits.")
+
+        for ligne in data["lignes"]:
+            if ligne["ligne_vente"].vente_id != venteproduits.pk:
+                raise serializers.ValidationError("Une des lignes indiquées n'appartient pas à cette vente.")
+
+        if data.get("rembourser_en_especes"):
+            if vente.mode_paiement != "mixte":
+                raise serializers.ValidationError(
+                    "\"Rembourser en espèces\" ne s'applique qu'à une vente en paiement mixte."
+                )
+            if not vente.paiements.filter(mode_paiement="especes").exists():
+                raise serializers.ValidationError(
+                    "Cette vente n'a pas de portion payée en espèces à rembourser en liquide."
+                )
+
+        utilisateur = self.context["utilisateur"]
+        if not SessionCaisse.objects.filter(utilisateur=utilisateur, statut=StatutSession.OUVERTE).exists():
+            raise serializers.ValidationError(
+                "Aucune session de caisse ouverte — ouvre la caisse avant d'enregistrer un retour."
+            )
+        return data
+
+    def create(self, validated_data):
+        vente = self.context["vente"]
+        utilisateur = self.context["utilisateur"]
+
+        with transaction.atomic():
+            session = SessionCaisse.objects.filter(utilisateur=utilisateur, statut=StatutSession.OUVERTE).first()
+            if session is None:
+                raise serializers.ValidationError(
+                    "Aucune session de caisse ouverte — ouvre la caisse avant d'enregistrer un retour."
+                )
+
+            montant_total = Decimal("0")
+            lignes_pretes = []
+            for ligne in validated_data["lignes"]:
+                # select_for_update() verrouille la ligne de vente le
+                # temps du calcul de la quantité déjà retournue, pour
+                # empêcher deux retours concurrents de dépasser la
+                # quantité vendue à eux deux.
+                ligne_vente = LigneVente.objects.select_for_update().get(pk=ligne["ligne_vente"].pk)
+                deja_retournee = ligne_vente.retours.aggregate(total=Sum("quantite"))["total"] or Decimal("0")
+                restante = ligne_vente.quantite - deja_retournee
+                if ligne["quantite"] > restante:
+                    raise serializers.ValidationError(
+                        f"Impossible de retourner {ligne['quantite']} de {ligne_vente.produit.nom} "
+                        f"— il n'en reste que {restante} à retourner sur cette ligne."
+                    )
+                montant_ligne = ligne_vente.prix_unitaire_vente * ligne["quantite"]
+                montant_total += montant_ligne
+                lignes_pretes.append((ligne_vente, ligne["quantite"]))
+
+            if vente.mode_paiement == "especes":
+                affecte_caisse = True
+            elif vente.mode_paiement == "mixte":
+                affecte_caisse = bool(validated_data.get("rembourser_en_especes"))
+            else:
+                affecte_caisse = False
+
+            retour = RetourVente.objects.create(
+                vente=vente,
+                session_caisse=session,
+                utilisateur=utilisateur,
+                montant_total=montant_total,
+                affecte_caisse=affecte_caisse,
+                commentaire=validated_data.get("commentaire", ""),
+            )
+            for ligne_vente, quantite in lignes_pretes:
+                LigneRetour.objects.create(retour=retour, ligne_vente=ligne_vente, quantite=quantite)
+                produit = Produit.objects.select_for_update().get(pk=ligne_vente.produit_id)
+                produit.quantite_stock = F("quantite_stock") + quantite
+                produit.save(update_fields=["quantite_stock"])
+
+            # Une vente à crédit remboursée en partie réduit d'autant la
+            # dette du client — peut devenir négatif si le client avait
+            # déjà remboursé une partie de cette même vente (avoir en
+            # faveur du client, assumé et affiché comme tel côté fiche client).
+            if vente.mode_paiement == "credit" and vente.client_id:
+                client = Client.objects.select_for_update().get(pk=vente.client_id)
+                client.solde_credit = F("solde_credit") - montant_total
+                client.save(update_fields=["solde_credit"])
+            elif vente.mode_paiement == "mixte" and vente.client_id:
+                # La part à crédit d'une vente mixte n'est pas rattachée à
+                # des lignes précises (juste un montant global) — on
+                # réduit donc la dette au prorata de la part que ce retour
+                # représente sur le total de la vente d'origine.
+                ligne_credit = vente.paiements.filter(mode_paiement="credit").first()
+                if ligne_credit:
+                    montant_a_deduire = (ligne_credit.montant * montant_total / vente.montant_total).quantize(
+                        Decimal("0.01")
+                    )
+                    client = Client.objects.select_for_update().get(pk=vente.client_id)
+                    client.solde_credit = F("solde_credit") - montant_a_deduire
+                    client.save(update_fields=["solde_credit"])
+
+            return retour
+
+
+class RetourVenteLectureSerializer(serializers.ModelSerializer):
+    utilisateur_nom = serializers.StringRelatedField(source="utilisateur", read_only=True)
+
+    class Meta:
+        model = RetourVente
+        fields = [
+            "id", "vente", "session_caisse", "utilisateur_nom", "date_heure",
+            "montant_total", "affecte_caisse", "commentaire",
+        ]
+
 
 # ============================================================
 # Chapitre 13 — Approvisionnement : réception de marchandise
@@ -281,26 +590,16 @@ class TransactionCaisseLectureSerializer(serializers.ModelSerializer):
 # ============================================================
 
 from decimal import Decimal
-from .models import Approvisionnement, LigneAppro, Fournisseur
+from .models import Approvisionnement, LigneAppro, Fournisseur, ModePaiementAppro
 
 
 class LigneApproEcritureSerializer(serializers.Serializer):
     produit = serializers.PrimaryKeyRelatedField(queryset=Produit.objects.filter(actif=True))
-    quantite_recue = serializers.DecimalField(max_digits=10, decimal_places=3, min_value=0.001)
-    # Mode "unité" : prix_unitaire_achat rempli directement.
-    # Mode "lot" : prix_lot ET quantite_par_lot remplis à la place —
-    # prix_unitaire_achat devient optionnel en entrée, il est
-    # RECALCULÉ côté serveur (jamais fait confiance à un calcul fait
-    # côté app, même si l'app l'affiche déjà pour l'ergonomie).
-    prix_unitaire_achat = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0, required=False)
-    prix_lot = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0, required=False)
-    quantite_par_lot = serializers.DecimalField(max_digits=10, decimal_places=3, min_value=0.001, required=False)
-    # NOUVEAU, optionnel : permet de mettre à jour le prix de VENTE du
-    # produit directement depuis la réception, pratique quand on
-    # reçoit un produit et qu'on décide son prix de vente dans la
-    # foulée plutôt que de repasser par Catalogue. Ignoré si absent —
-    # le prix de vente existant reste inchangé.
-    prix_vente = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0, required=False)
+    quantite_recue = serializers.DecimalField(max_digits=10, decimal_places=3, min_value=Decimal("0.001"))
+    prix_unitaire_achat = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False)
+    prix_lot = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False)
+    quantite_par_lot = serializers.DecimalField(max_digits=10, decimal_places=3, min_value=Decimal("0.001"), required=False)
+    prix_vente = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False)
 
     def validate(self, data):
         achat_lot = data.get("prix_lot") is not None or data.get("quantite_par_lot") is not None
@@ -336,21 +635,46 @@ class ApprovisionnementCreationSerializer(serializers.Serializer):
     fournisseur = serializers.PrimaryKeyRelatedField(queryset=Fournisseur.objects.all())
     numero_facture = serializers.CharField(required=False, allow_blank=True, max_length=50)
     lignes = LigneApproEcritureSerializer(many=True)
+    # Modalité de paiement du fournisseur pour cette réception — comptant
+    # (tout payé maintenant), tranche (paiement partiel, reste dû) ou
+    # crédit (rien payé, tout dû). Miroir du crédit client, mais côté achats.
+    mode_paiement = serializers.ChoiceField(
+        choices=ModePaiementAppro.choices, default=ModePaiementAppro.COMPTANT
+    )
+    montant_paye = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False
+    )
 
     def validate_lignes(self, value):
         if not value:
             raise serializers.ValidationError("Un approvisionnement doit contenir au moins une ligne.")
         return value
 
+    def validate(self, data):
+        mode = data.get("mode_paiement", ModePaiementAppro.COMPTANT)
+        montant_paye = data.get("montant_paye")
+        if mode == ModePaiementAppro.CREDIT and montant_paye:
+            raise serializers.ValidationError(
+                "Une réception à crédit ne peut pas avoir de montant payé."
+            )
+        if mode == ModePaiementAppro.TRANCHE and montant_paye is None:
+            raise serializers.ValidationError(
+                "Indique le montant payé maintenant pour un paiement en tranche."
+            )
+        return data
+
     def create(self, validated_data):
         lignes_data = validated_data.pop("lignes")
+        mode = validated_data.get("mode_paiement", ModePaiementAppro.COMPTANT)
 
         with transaction.atomic():
             appro = Approvisionnement.objects.create(
                 fournisseur=validated_data["fournisseur"],
                 numero_facture=validated_data.get("numero_facture", ""),
+                mode_paiement=mode,
             )
 
+            montant_total_calcule = Decimal("0")
             for ligne in lignes_data:
                 # Même principe de verrouillage que pour la vente : on
                 # bloque la ligne produit pendant tout le calcul, pour
@@ -378,6 +702,8 @@ class ApprovisionnementCreationSerializer(serializers.Serializer):
                 valeur_totale = (stock_avant * prix_moyen_avant) + (quantite * prix_lot)
                 nouveau_prix_moyen = (valeur_totale / nouveau_stock).quantize(Decimal("0.01"))
 
+                montant_total_calcule += quantite * prix_lot
+
                 LigneAppro.objects.create(
                     appro=appro, produit=produit,
                     quantite_recue=quantite, prix_unitaire_achat=prix_lot,
@@ -403,6 +729,29 @@ class ApprovisionnementCreationSerializer(serializers.Serializer):
 
                 produit.save(update_fields=champs_modifies)
 
+            if mode == ModePaiementAppro.COMPTANT:
+                montant_paye_final = montant_total_calcule
+            elif mode == ModePaiementAppro.CREDIT:
+                montant_paye_final = Decimal("0")
+            else:
+                montant_paye_final = validated_data.get("montant_paye") or Decimal("0")
+                if montant_paye_final > montant_total_calcule:
+                    raise serializers.ValidationError(
+                        "Le montant payé dépasse le total de la réception."
+                    )
+
+            appro.montant_total = montant_total_calcule
+            appro.montant_paye = montant_paye_final
+            appro.save(update_fields=["montant_total", "montant_paye"])
+
+            montant_du = montant_total_calcule - montant_paye_final
+            if montant_du > 0:
+                fournisseur = Fournisseur.objects.select_for_update().get(
+                    pk=validated_data["fournisseur"].pk
+                )
+                fournisseur.solde_du = F("solde_du") + montant_du
+                fournisseur.save(update_fields=["solde_du"])
+
             return appro
 
 
@@ -412,7 +761,10 @@ class ApprovisionnementLectureSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Approvisionnement
-        fields = ["id", "date_reception", "fournisseur", "fournisseur_nom", "numero_facture", "lignes"]
+        fields = [
+            "id", "date_reception", "fournisseur", "fournisseur_nom", "numero_facture", "lignes",
+            "montant_total", "mode_paiement", "montant_paye",
+        ]
 
 
 # ============================================================
@@ -452,11 +804,22 @@ class PrestationCreationSerializer(serializers.Serializer):
         # quelconque après celle de TransactionCaisse, on ne veut pas
         # une transaction "orpheline" sans son sous-type.
         with transaction.atomic():
+            # Même règle que pour une vente : une prestation payée en
+            # espèces doit compter dans le rapport Z de la session en cours.
+            session = SessionCaisse.objects.filter(
+                utilisateur=utilisateur, statut=StatutSession.OUVERTE
+            ).first()
+            if session is None:
+                raise serializers.ValidationError(
+                    "Aucune session de caisse ouverte — ouvre la caisse avant d'enregistrer une prestation."
+                )
+
             transaction_caisse = TransactionCaisse.objects.create(
                 montant_total=montant_total,
                 mode_paiement=validated_data["mode_paiement"],
                 utilisateur=utilisateur,
                 client=validated_data.get("client"),
+                session_caisse=session,
             )
             PrestationService.objects.create(
                 transaction=transaction_caisse, service=service, quantite=quantite,
@@ -562,6 +925,37 @@ class MonProfilSerializer(serializers.Serializer):
     nouveau_mot_de_passe = serializers.CharField(write_only=True, required=False, min_length=6)
 
 
+class UtilisateurEditionSerializer(serializers.Serializer):
+    """
+    Édition par un ADMIN d'un AUTRE compte (nom, téléphone, identifiant
+    de connexion, mot de passe) — distinct de ModifierPermissionsSerializer
+    (permissions uniquement) et de MonProfilSerializer (auto-édition).
+    Tous les champs sont optionnels : seuls ceux envoyés sont modifiés.
+    """
+    nom = serializers.CharField(max_length=100, required=False)
+    telephone = serializers.CharField(max_length=20, required=False)
+    username = serializers.CharField(max_length=150, required=False)
+    nouveau_mot_de_passe = serializers.CharField(write_only=True, required=False, min_length=6)
+
+    def validate_username(self, value):
+        # exclude=self.instance : permet de renvoyer le même identifiant
+        # sans se le faire refuser comme "déjà utilisé" par soi-même.
+        qs = User.objects.filter(username=value)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.compte_id)
+        if qs.exists():
+            raise serializers.ValidationError("Cet identifiant est déjà utilisé.")
+        return value
+
+    def validate_telephone(self, value):
+        qs = Utilisateur.objects.filter(telephone=value)
+        if self.instance is not None:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("Ce téléphone est déjà utilisé par un autre compte.")
+        return value
+
+
 # ============================================================
 # Ajustement de stock — correction manuelle et motivée, distincte
 # d'une vente (sort du stock) ou d'une réception (entre en stock
@@ -620,8 +1014,15 @@ class AjustementStockLectureSerializer(serializers.ModelSerializer):
 # ============================================================
 
 class RemboursementCreditSerializer(serializers.Serializer):
+    """
+    POST /api/remboursements-credit/
+    {
+      "client": 3,
+      "montant": "5000.00"
+    }
+    """
     client = serializers.PrimaryKeyRelatedField(queryset=Client.objects.all())
-    montant = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=0.01)
+    montant = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0.01"))
 
     def validate(self, data):
         if data["montant"] > data["client"].solde_credit:
@@ -641,3 +1042,177 @@ class RemboursementCreditSerializer(serializers.Serializer):
             client.save(update_fields=["solde_credit"])
         client.refresh_from_db()
         return client
+
+
+class RemboursementCreditLectureSerializer(serializers.ModelSerializer):
+    utilisateur_nom = serializers.StringRelatedField(source="utilisateur", read_only=True)
+
+    class Meta:
+        model = RemboursementCredit
+        fields = ["id", "client", "montant", "utilisateur_nom", "date_heure"]
+
+
+# ============================================================
+# Paiement fournisseur — miroir de RemboursementCredit, côté achats :
+# réduit Fournisseur.solde_du quand la superette règle une dette.
+# ============================================================
+
+from .models import PaiementFournisseur
+
+
+class PaiementFournisseurSerializer(serializers.Serializer):
+    """
+    POST /api/paiements-fournisseur/
+    {
+      "fournisseur": 2,
+      "montant": "5000.00"
+    }
+    """
+    fournisseur = serializers.PrimaryKeyRelatedField(queryset=Fournisseur.objects.all())
+    montant = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0.01"))
+
+    def validate(self, data):
+        if data["montant"] > data["fournisseur"].solde_du:
+            raise serializers.ValidationError(
+                f"Le montant dépasse la dette envers ce fournisseur ({data['fournisseur'].solde_du} F)."
+            )
+        return data
+
+    def create(self, validated_data):
+        utilisateur = self.context["utilisateur"]
+        fournisseur = validated_data["fournisseur"]
+        with transaction.atomic():
+            PaiementFournisseur.objects.create(
+                fournisseur=fournisseur, montant=validated_data["montant"], utilisateur=utilisateur
+            )
+            fournisseur.solde_du = F("solde_du") - validated_data["montant"]
+            fournisseur.save(update_fields=["solde_du"])
+        fournisseur.refresh_from_db()
+        return fournisseur
+
+
+class PaiementFournisseurLectureSerializer(serializers.ModelSerializer):
+    utilisateur_nom = serializers.StringRelatedField(source="utilisateur", read_only=True)
+
+    class Meta:
+        model = PaiementFournisseur
+        fields = ["id", "fournisseur", "montant", "utilisateur_nom", "date_heure"]
+
+
+# ============================================================
+# Session de caisse — ouverture/fermeture, avec rapport Z à la
+# fermeture (fond déclaré vs espèces réellement comptées).
+# ============================================================
+
+from django.utils import timezone
+
+
+def calculer_totaux_session(session):
+    """
+    Calcule les totaux d'une session de caisse — utilisé aussi bien pour
+    l'affichage en direct (session encore ouverte, GET .../courante/) que
+    pour figer le rapport Z à la fermeture. Ne modifie jamais la session.
+    """
+    transactions = TransactionCaisse.objects.filter(session_caisse=session, annulee=False)
+    ventes_especes = transactions.filter(mode_paiement="especes").aggregate(
+        total=Sum("montant_total")
+    )["total"] or Decimal("0")
+    # Part espèces des ventes en paiement mixte de cette session — une
+    # vente mixte n'a pas mode_paiement="especes" (c'est "mixte"), donc
+    # invisible à l'agrégat ci-dessus ; sa ligne PaiementVente en espèces
+    # doit quand même compter dans la caisse physique.
+    ventes_especes_mixte = PaiementVente.objects.filter(
+        mode_paiement="especes", vente__session_caisse=session, vente__annulee=False
+    ).aggregate(total=Sum("montant"))["total"] or Decimal("0")
+    ventes_especes += ventes_especes_mixte
+    # Les retours en espèces sortent physiquement de LA CAISSE DU JOUR,
+    # donc toujours rattachés à la session actuellement ouverte (voir
+    # RetourVenteCreationSerializer) — jamais à la session de la vente
+    # d'origine, qui peut être une session différente, déjà fermée.
+    retours_especes = RetourVente.objects.filter(session_caisse=session, affecte_caisse=True).aggregate(
+        total=Sum("montant_total")
+    )["total"] or Decimal("0")
+    montant_attendu = session.fond_ouverture + ventes_especes - retours_especes
+    return {
+        "ventes_especes": ventes_especes,
+        "retours_especes": retours_especes,
+        "montant_attendu": montant_attendu,
+    }
+
+
+class SessionCaisseOuvertureSerializer(serializers.Serializer):
+    """
+    POST /api/sessions-caisse/ouvrir/
+    { "fond_ouverture": "10000.00" }
+    """
+    fond_ouverture = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False
+    )
+
+    def create(self, validated_data):
+        utilisateur = self.context["utilisateur"]
+        if SessionCaisse.objects.filter(utilisateur=utilisateur, statut=StatutSession.OUVERTE).exists():
+            raise serializers.ValidationError("Tu as déjà une session de caisse ouverte.")
+        return SessionCaisse.objects.create(
+            utilisateur=utilisateur,
+            fond_ouverture=validated_data.get("fond_ouverture") or Decimal("0"),
+        )
+
+
+class SessionCaisseFermetureSerializer(serializers.Serializer):
+    """
+    POST /api/sessions-caisse/<id>/fermer/
+    { "montant_compte": "45000.00", "commentaire": "RAS" }
+    """
+    montant_compte = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0"))
+    commentaire = serializers.CharField(required=False, allow_blank=True, max_length=255)
+
+    def update(self, instance, validated_data):
+        totaux = calculer_totaux_session(instance)
+        instance.montant_attendu = totaux["montant_attendu"]
+        instance.montant_compte = validated_data["montant_compte"]
+        instance.ecart = validated_data["montant_compte"] - totaux["montant_attendu"]
+        instance.commentaire_fermeture = validated_data.get("commentaire", "")
+        instance.date_fermeture = timezone.now()
+        instance.statut = StatutSession.FERMEE
+        instance.save(update_fields=[
+            "montant_attendu", "montant_compte", "ecart",
+            "commentaire_fermeture", "date_fermeture", "statut",
+        ])
+        return instance
+
+
+class SessionCaisseLectureSerializer(serializers.ModelSerializer):
+    utilisateur_nom = serializers.StringRelatedField(source="utilisateur", read_only=True)
+
+    class Meta:
+        model = SessionCaisse
+        fields = [
+            "id", "utilisateur", "utilisateur_nom", "date_ouverture", "fond_ouverture",
+            "date_fermeture", "montant_compte", "montant_attendu", "ecart",
+            "statut", "commentaire_fermeture",
+        ]
+
+
+# ============================================================
+# Archivage de créance — voir le commentaire sur les modèles
+# ArchiveCreanceClient/ArchiveCreanceFournisseur (models.py).
+# ============================================================
+
+from .models import ArchiveCreanceClient, ArchiveCreanceFournisseur
+
+
+class ArchiveCreanceClientSerializer(serializers.ModelSerializer):
+    utilisateur_nom = serializers.StringRelatedField(source="utilisateur", read_only=True)
+
+    class Meta:
+        model = ArchiveCreanceClient
+        fields = ["id", "date_archivage", "total_mis_a_credit", "total_rembourse", "utilisateur_nom"]
+
+
+class ArchiveCreanceFournisseurSerializer(serializers.ModelSerializer):
+    utilisateur_nom = serializers.StringRelatedField(source="utilisateur", read_only=True)
+
+    class Meta:
+        model = ArchiveCreanceFournisseur
+        fields = ["id", "date_archivage", "total_recu_a_credit", "total_paye", "utilisateur_nom"]
