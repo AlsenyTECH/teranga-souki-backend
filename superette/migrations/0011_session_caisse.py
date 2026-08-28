@@ -12,16 +12,6 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        # Toutes les tables de cette base sont en MyISAM (aucune contrainte
-        # FOREIGN KEY réelle nulle part), mais le moteur par défaut du
-        # serveur MySQL est InnoDB — sans ce SET, la table créée ci-dessous
-        # serait InnoDB et l'ADD CONSTRAINT vers superette_utilisateur
-        # (MyISAM) échouerait avec l'erreur 1824 ("Failed to open the
-        # referenced table"). SET (sans GLOBAL) ne modifie que la session.
-        migrations.RunSQL(
-            "SET default_storage_engine = 'MyISAM'",
-            reverse_sql="SET default_storage_engine = 'InnoDB'",
-        ),
         migrations.CreateModel(
             name='SessionCaisse',
             fields=[
@@ -36,10 +26,6 @@ class Migration(migrations.Migration):
                 ('commentaire_fermeture', models.CharField(blank=True, max_length=255)),
                 ('utilisateur', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='sessions_caisse', to='superette.utilisateur')),
             ],
-        ),
-        migrations.RunSQL(
-            "SET default_storage_engine = 'InnoDB'",
-            reverse_sql="SET default_storage_engine = 'MyISAM'",
         ),
         migrations.AddField(
             model_name='transactioncaisse',

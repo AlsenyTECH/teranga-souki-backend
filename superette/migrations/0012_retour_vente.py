@@ -12,15 +12,6 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        # Voir 0011_session_caisse.py pour l'explication complète : toutes
-        # les tables de cette base sont en MyISAM (aucune contrainte FK
-        # réelle), mais le moteur par défaut du serveur MySQL est InnoDB —
-        # sans ce SET, ces deux nouvelles tables seraient InnoDB et leurs
-        # ADD CONSTRAINT vers des tables MyISAM échoueraient (erreur 1824).
-        migrations.RunSQL(
-            "SET default_storage_engine = 'MyISAM'",
-            reverse_sql="SET default_storage_engine = 'InnoDB'",
-        ),
         migrations.CreateModel(
             name='RetourVente',
             fields=[
@@ -42,9 +33,5 @@ class Migration(migrations.Migration):
                 ('ligne_vente', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='retours', to='superette.lignevente')),
                 ('retour', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='lignes', to='superette.retourvente')),
             ],
-        ),
-        migrations.RunSQL(
-            "SET default_storage_engine = 'InnoDB'",
-            reverse_sql="SET default_storage_engine = 'MyISAM'",
         ),
     ]

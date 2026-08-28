@@ -32,20 +32,6 @@ class Migration(migrations.Migration):
             name='solde_du',
             field=models.DecimalField(decimal_places=2, default=0, max_digits=10),
         ),
-        # Toutes les tables de cette base (y compris superette_fournisseur et
-        # superette_utilisateur, référencées ci-dessous) sont en MyISAM, un
-        # moteur qui ne supporte pas les contraintes FOREIGN KEY — aucune
-        # table de l'app n'en a jamais eu, l'intégrité référentielle est
-        # gérée uniquement côté ORM Django (on_delete=PROTECT). Le moteur
-        # par défaut de ce serveur MySQL est InnoDB : sans ce SET, la table
-        # créée ci-dessous serait InnoDB et Django échouerait à ajouter les
-        # FK (erreur 1824, "Failed to open the referenced table") puisque
-        # InnoDB exige que la table référencée le soit aussi. SET (sans
-        # GLOBAL) ne modifie que la session courante.
-        migrations.RunSQL(
-            "SET default_storage_engine = 'MyISAM'",
-            reverse_sql="SET default_storage_engine = 'InnoDB'",
-        ),
         migrations.CreateModel(
             name='PaiementFournisseur',
             fields=[
@@ -55,9 +41,5 @@ class Migration(migrations.Migration):
                 ('fournisseur', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, to='superette.fournisseur')),
                 ('utilisateur', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, to='superette.utilisateur')),
             ],
-        ),
-        migrations.RunSQL(
-            "SET default_storage_engine = 'InnoDB'",
-            reverse_sql="SET default_storage_engine = 'MyISAM'",
         ),
     ]

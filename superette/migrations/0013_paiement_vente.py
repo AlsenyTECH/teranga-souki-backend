@@ -17,14 +17,6 @@ class Migration(migrations.Migration):
             name='mode_paiement',
             field=models.CharField(choices=[('especes', 'Espèces'), ('wave', 'Wave'), ('orange_money', 'Orange Money'), ('credit', 'Crédit client'), ('mixte', 'Paiement mixte')], max_length=20),
         ),
-        # Toutes les tables de cette base sont en MyISAM (aucune contrainte FK
-        # réelle nulle part), mais le moteur par défaut du serveur MySQL est
-        # InnoDB — sans ce garde-fou, CreateModel échoue avec l'erreur 1824
-        # ("Failed to open the referenced table") sur la FK vers transactioncaisse.
-        migrations.RunSQL(
-            "SET default_storage_engine = 'MyISAM'",
-            reverse_sql="SET default_storage_engine = 'InnoDB'",
-        ),
         migrations.CreateModel(
             name='PaiementVente',
             fields=[
@@ -33,9 +25,5 @@ class Migration(migrations.Migration):
                 ('montant', models.DecimalField(decimal_places=2, max_digits=10, validators=[django.core.validators.MinValueValidator(0.01)])),
                 ('vente', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='paiements', to='superette.transactioncaisse')),
             ],
-        ),
-        migrations.RunSQL(
-            "SET default_storage_engine = 'InnoDB'",
-            reverse_sql="SET default_storage_engine = 'MyISAM'",
         ),
     ]
