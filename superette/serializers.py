@@ -622,6 +622,144 @@ class LigneApproLectureSerializer(serializers.ModelSerializer):
         fields = ["id", "produit", "produit_nom", "produit_unite_vente", "quantite_recue", "prix_unitaire_achat", "prix_lot", "quantite_par_lot"]
 
 
+def _appliquer_ligne_appro(appro, ligne):
+    """
+    Applique l'effet d'UNE ligne de réception sur son produit (stock +
+    CUMP) et crée la LigneAppro correspondante. Facteur commun entre
+    la création et la modification d'un approvisionnement — voir
+    ApprovisionnementCreationSerializer.create() et
+    ApprovisionnementModificationSerializer.update() qui l'appellent
+    toutes les deux à l'intérieur d'un même verrou select_for_update().
+    Renvoie le montant total de cette ligne (quantité × prix réel).
+    """
+    produit = Produit.objects.select_for_update().get(pk=ligne["produit"].pk)
+
+    stock_avant = produit.quantite_stock
+    prix_moyen_avant = produit.prix_achat_moyen
+    quantite = ligne["quantite_recue"]
+
+    # Calcul du prix unitaire réel, quel que soit le mode de saisie —
+    # c'est CETTE valeur, jamais celle affichée côté app, qui sert de
+    # source de vérité pour le CUMP.
+    prix_lot_saisi = ligne.get("prix_lot")
+    quantite_par_lot = ligne.get("quantite_par_lot")
+    if prix_lot_saisi is not None and quantite_par_lot is not None:
+        prix_lot = (prix_lot_saisi / quantite_par_lot).quantize(Decimal("0.01"))
+    else:
+        prix_lot = ligne["prix_unitaire_achat"]
+
+    nouveau_stock = stock_avant + quantite
+    # Decimal partout ici (jamais float) — cohérent avec la décision du
+    # chapitre 4 sur la précision monétaire.
+    valeur_totale = (stock_avant * prix_moyen_avant) + (quantite * prix_lot)
+    nouveau_prix_moyen = (valeur_totale / nouveau_stock).quantize(Decimal("0.01"))
+
+    LigneAppro.objects.create(
+        appro=appro, produit=produit,
+        quantite_recue=quantite, prix_unitaire_achat=prix_lot,
+        prix_lot=prix_lot_saisi, quantite_par_lot=quantite_par_lot,
+    )
+
+    # Ici on assigne les valeurs déjà calculées en Python, pas via F()
+    # — contrairement à la vente. Différence volontaire : le calcul du
+    # CUMP a BESOIN de connaître la valeur exacte actuelle (pas juste
+    # "soustraire X"), et select_for_update() nous garantit qu'aucune
+    # autre transaction ne peut avoir changé cette ligne entre notre
+    # lecture et notre écriture — le verrou remplace ici le rôle que
+    # F() jouait pour la vente.
+    produit.quantite_stock = nouveau_stock
+    produit.prix_achat_moyen = nouveau_prix_moyen
+    champs_modifies = ["quantite_stock", "prix_achat_moyen"]
+
+    prix_vente_saisi = ligne.get("prix_vente")
+    if prix_vente_saisi is not None:
+        produit.prix_vente = prix_vente_saisi
+        champs_modifies.append("prix_vente")
+
+    produit.save(update_fields=champs_modifies)
+
+    return quantite * prix_lot
+
+
+def _calculer_montant_paye(mode, montant_paye_saisi, montant_total_calcule):
+    """Partagé entre création et modification — même règle des trois
+    modalités de paiement (comptant/tranche/crédit) dans les deux cas."""
+    if mode == ModePaiementAppro.COMPTANT:
+        return montant_total_calcule
+    if mode == ModePaiementAppro.CREDIT:
+        return Decimal("0")
+    montant_paye_final = montant_paye_saisi or Decimal("0")
+    if montant_paye_final > montant_total_calcule:
+        raise serializers.ValidationError("Le montant payé dépasse le total de la réception.")
+    return montant_paye_final
+
+
+def verifier_appro_modifiable(appro):
+    """
+    Une réception ne peut être modifiée/supprimée QUE si aucun de ses
+    produits n'a bougé depuis (autre réception, vente ou ajustement de
+    stock plus récent) — sinon le CUMP et le stock actuels dépendent de
+    mouvements qu'on ne peut plus démêler proprement. Lève une
+    ValidationError explicite (nommant le produit) sinon, plutôt que de
+    risquer un stock/CUMP incohérent.
+    """
+    for ligne in appro.lignes.select_related("produit").all():
+        produit = ligne.produit
+        plus_recente_appro = (
+            LigneAppro.objects.filter(produit=produit, appro__date_reception__gt=appro.date_reception)
+            .exists()
+        )
+        vente_posterieure = LigneVente.objects.filter(
+            produit=produit, vente__date_heure__gt=appro.date_reception
+        ).exists()
+        ajustement_posterieur = AjustementStock.objects.filter(
+            produit=produit, date_heure__gt=appro.date_reception
+        ).exists()
+        if plus_recente_appro or vente_posterieure or ajustement_posterieur:
+            raise serializers.ValidationError(
+                f"« {produit.nom} » a bougé depuis cette réception (vente, ajustement ou "
+                "autre réception plus récente) — impossible de la modifier ou de la supprimer."
+            )
+
+
+def inverser_effet_appro(appro):
+    """
+    Défait précisément l'effet d'une réception déjà enregistrée : pour
+    chaque ligne, retire la quantité reçue du stock et reconstitue le
+    CUMP d'AVANT cette réception (à partir de la valeur totale actuelle,
+    en retirant exactement ce que cette ligne y avait ajouté), puis
+    retire de la dette fournisseur ce que cette réception y avait ajouté.
+    Ne fait rien de destructeur sur les lignes elles-mêmes — l'appelant
+    (delete ou update) décide de les supprimer ensuite. À n'appeler
+    qu'après verifier_appro_modifiable(appro).
+    """
+    for ligne in appro.lignes.all():
+        produit = Produit.objects.select_for_update().get(pk=ligne.produit_id)
+        stock_apres = produit.quantite_stock
+        valeur_totale_apres = stock_apres * produit.prix_achat_moyen
+        valeur_ligne = ligne.quantite_recue * ligne.prix_unitaire_achat
+
+        stock_avant = stock_apres - ligne.quantite_recue
+        valeur_totale_avant = valeur_totale_apres - valeur_ligne
+        # Si plus aucun stock ne reste, il n'y a plus de moyenne
+        # significative à reconstituer — on la laisse à 0 plutôt que de
+        # diviser par zéro (cohérent avec un produit jamais reçu).
+        prix_moyen_avant = (
+            (valeur_totale_avant / stock_avant).quantize(Decimal("0.01"))
+            if stock_avant > 0 else Decimal("0")
+        )
+
+        produit.quantite_stock = stock_avant
+        produit.prix_achat_moyen = prix_moyen_avant
+        produit.save(update_fields=["quantite_stock", "prix_achat_moyen"])
+
+    montant_du_annule = appro.montant_total - appro.montant_paye
+    if montant_du_annule > 0:
+        fournisseur = Fournisseur.objects.select_for_update().get(pk=appro.fournisseur_id)
+        fournisseur.solde_du = F("solde_du") - montant_du_annule
+        fournisseur.save(update_fields=["solde_du"])
+
+
 class ApprovisionnementCreationSerializer(serializers.Serializer):
     """
     POST /api/approvisionnements/
@@ -676,73 +814,61 @@ class ApprovisionnementCreationSerializer(serializers.Serializer):
 
             montant_total_calcule = Decimal("0")
             for ligne in lignes_data:
-                # Même principe de verrouillage que pour la vente : on
-                # bloque la ligne produit pendant tout le calcul, pour
-                # qu'une vente ou une autre réception simultanée sur ce
-                # même produit ne lise pas un stock/prix "entre deux".
-                produit = Produit.objects.select_for_update().get(pk=ligne["produit"].pk)
+                montant_total_calcule += _appliquer_ligne_appro(appro, ligne)
 
-                stock_avant = produit.quantite_stock
-                prix_moyen_avant = produit.prix_achat_moyen
-                quantite = ligne["quantite_recue"]
-
-                # Calcul du prix unitaire réel, quel que soit le mode de
-                # saisie — c'est CETTE valeur, jamais celle affichée côté
-                # app, qui sert de source de vérité pour le CUMP.
-                prix_lot_saisi = ligne.get("prix_lot")
-                quantite_par_lot = ligne.get("quantite_par_lot")
-                if prix_lot_saisi is not None and quantite_par_lot is not None:
-                    prix_lot = (prix_lot_saisi / quantite_par_lot).quantize(Decimal("0.01"))
-                else:
-                    prix_lot = ligne["prix_unitaire_achat"]
-
-                nouveau_stock = stock_avant + quantite
-                # Decimal partout ici (jamais float) — cohérent avec la
-                # décision du chapitre 4 sur la précision monétaire.
-                valeur_totale = (stock_avant * prix_moyen_avant) + (quantite * prix_lot)
-                nouveau_prix_moyen = (valeur_totale / nouveau_stock).quantize(Decimal("0.01"))
-
-                montant_total_calcule += quantite * prix_lot
-
-                LigneAppro.objects.create(
-                    appro=appro, produit=produit,
-                    quantite_recue=quantite, prix_unitaire_achat=prix_lot,
-                    prix_lot=prix_lot_saisi, quantite_par_lot=quantite_par_lot,
-                )
-
-                # Ici on assigne les valeurs déjà calculées en Python,
-                # pas via F() — contrairement à la vente. Différence
-                # volontaire : le calcul du CUMP a BESOIN de connaître
-                # la valeur exacte actuelle (pas juste "soustraire X"),
-                # et select_for_update() nous garantit qu'aucune autre
-                # transaction ne peut avoir changé cette ligne entre
-                # notre lecture et notre écriture — le verrou remplace
-                # ici le rôle que F() jouait pour la vente.
-                produit.quantite_stock = nouveau_stock
-                produit.prix_achat_moyen = nouveau_prix_moyen
-                champs_modifies = ["quantite_stock", "prix_achat_moyen"]
-
-                prix_vente_saisi = ligne.get("prix_vente")
-                if prix_vente_saisi is not None:
-                    produit.prix_vente = prix_vente_saisi
-                    champs_modifies.append("prix_vente")
-
-                produit.save(update_fields=champs_modifies)
-
-            if mode == ModePaiementAppro.COMPTANT:
-                montant_paye_final = montant_total_calcule
-            elif mode == ModePaiementAppro.CREDIT:
-                montant_paye_final = Decimal("0")
-            else:
-                montant_paye_final = validated_data.get("montant_paye") or Decimal("0")
-                if montant_paye_final > montant_total_calcule:
-                    raise serializers.ValidationError(
-                        "Le montant payé dépasse le total de la réception."
-                    )
+            montant_paye_final = _calculer_montant_paye(
+                mode, validated_data.get("montant_paye"), montant_total_calcule
+            )
 
             appro.montant_total = montant_total_calcule
             appro.montant_paye = montant_paye_final
             appro.save(update_fields=["montant_total", "montant_paye"])
+
+            montant_du = montant_total_calcule - montant_paye_final
+            if montant_du > 0:
+                fournisseur = Fournisseur.objects.select_for_update().get(
+                    pk=validated_data["fournisseur"].pk
+                )
+                fournisseur.solde_du = F("solde_du") + montant_du
+                fournisseur.save(update_fields=["solde_du"])
+
+            return appro
+
+
+class ApprovisionnementModificationSerializer(ApprovisionnementCreationSerializer):
+    """
+    PATCH /api/approvisionnements/<pk>/ — même forme que la création,
+    mais défait d'abord précisément l'effet de l'ancienne version avant
+    d'appliquer la nouvelle (voir inverser_effet_appro), dans la même
+    transaction. Refuse si la réception a bougé depuis (voir
+    verifier_appro_modifiable) — même garde-fou que la suppression.
+    """
+
+    def update(self, appro, validated_data):
+        lignes_data = validated_data.pop("lignes")
+        mode = validated_data.get("mode_paiement", ModePaiementAppro.COMPTANT)
+
+        with transaction.atomic():
+            appro = Approvisionnement.objects.select_for_update().get(pk=appro.pk)
+            verifier_appro_modifiable(appro)
+            inverser_effet_appro(appro)
+            appro.lignes.all().delete()
+
+            appro.fournisseur = validated_data["fournisseur"]
+            appro.numero_facture = validated_data.get("numero_facture", "")
+            appro.mode_paiement = mode
+
+            montant_total_calcule = Decimal("0")
+            for ligne in lignes_data:
+                montant_total_calcule += _appliquer_ligne_appro(appro, ligne)
+
+            montant_paye_final = _calculer_montant_paye(
+                mode, validated_data.get("montant_paye"), montant_total_calcule
+            )
+
+            appro.montant_total = montant_total_calcule
+            appro.montant_paye = montant_paye_final
+            appro.save(update_fields=["fournisseur", "numero_facture", "mode_paiement", "montant_total", "montant_paye"])
 
             montant_du = montant_total_calcule - montant_paye_final
             if montant_du > 0:

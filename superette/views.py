@@ -7,6 +7,8 @@ from rest_framework.authtoken.models import Token
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.utils import timezone
+from django.shortcuts import get_object_or_404
+from django.db import transaction
 
 from .models import (
     Categorie, Produit, Client, Fournisseur, Service, TransactionCaisse, Approvisionnement,
@@ -18,6 +20,7 @@ from .serializers import (
     FournisseurSerializer, ServiceSerializer,
     VenteCreationSerializer, TransactionCaisseLectureSerializer,
     ApprovisionnementCreationSerializer, ApprovisionnementLectureSerializer,
+    ApprovisionnementModificationSerializer, verifier_appro_modifiable, inverser_effet_appro,
     PrestationCreationSerializer, PrestationLectureSerializer,
     DepenseSerializer, RoleSerializer, UtilisateurSerializer, UtilisateurCreationSerializer,
     AjustementStockCreationSerializer, AjustementStockLectureSerializer,
@@ -167,6 +170,37 @@ class ApprovisionnementView(APIView):
             qs = qs.filter(fournisseur_id=fournisseur_id)
         serializer = ApprovisionnementLectureSerializer(qs, many=True)
         return Response(serializer.data)
+
+
+class ApprovisionnementDetailView(APIView):
+    """
+    PATCH/DELETE /api/approvisionnements/<pk>/ — corrige ou annule une
+    réception saisie par erreur. Refuse (400) si l'un de ses produits a
+    bougé depuis (voir serializers.verifier_appro_modifiable) : le CUMP
+    et le stock actuels dépendraient alors de mouvements postérieurs
+    qu'on ne peut plus démêler proprement.
+    """
+    permission_classes = [PeutGererApprovisionnement]
+
+    def get_object(self, pk):
+        return get_object_or_404(Approvisionnement, pk=pk)
+
+    def patch(self, request, pk):
+        appro = self.get_object(pk)
+        serializer = ApprovisionnementModificationSerializer(appro, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        appro = serializer.save()
+        out = ApprovisionnementLectureSerializer(appro)
+        return Response(out.data)
+
+    def delete(self, request, pk):
+        appro = self.get_object(pk)
+        with transaction.atomic():
+            appro = Approvisionnement.objects.select_for_update().get(pk=appro.pk)
+            verifier_appro_modifiable(appro)
+            inverser_effet_appro(appro)
+            appro.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class PrestationView(APIView):
