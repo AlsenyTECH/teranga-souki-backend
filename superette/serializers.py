@@ -710,7 +710,7 @@ def verifier_appro_modifiable(appro):
             .exists()
         )
         vente_posterieure = LigneVente.objects.filter(
-            produit=produit, vente__date_heure__gt=appro.date_reception
+            produit=produit, vente__transaction__date_heure__gt=appro.date_reception
         ).exists()
         ajustement_posterieur = AjustementStock.objects.filter(
             produit=produit, date_heure__gt=appro.date_reception
