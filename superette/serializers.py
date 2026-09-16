@@ -590,7 +590,7 @@ class RetourVenteLectureSerializer(serializers.ModelSerializer):
 # ============================================================
 
 from decimal import Decimal
-from .models import Approvisionnement, LigneAppro, Fournisseur, ModePaiementAppro
+from .models import Approvisionnement, LigneAppro, Fournisseur, ModePaiementAppro, RetourAppro, LigneRetourAppro
 
 
 class LigneApproEcritureSerializer(serializers.Serializer):
@@ -616,10 +616,23 @@ class LigneApproEcritureSerializer(serializers.Serializer):
 class LigneApproLectureSerializer(serializers.ModelSerializer):
     produit_nom = serializers.StringRelatedField(source="produit", read_only=True)
     produit_unite_vente = serializers.CharField(source="produit.unite_vente", read_only=True)
+    # Même mécanique que LigneVenteLectureSerializer : sans ça, le
+    # frontend ne peut pas plafonner le retour à ce qu'il reste à rendre.
+    quantite_retournee = serializers.SerializerMethodField()
+    quantite_restante = serializers.SerializerMethodField()
 
     class Meta:
         model = LigneAppro
-        fields = ["id", "produit", "produit_nom", "produit_unite_vente", "quantite_recue", "prix_unitaire_achat", "prix_lot", "quantite_par_lot"]
+        fields = [
+            "id", "produit", "produit_nom", "produit_unite_vente", "quantite_recue", "prix_unitaire_achat",
+            "prix_lot", "quantite_par_lot", "quantite_retournee", "quantite_restante",
+        ]
+
+    def get_quantite_retournee(self, obj):
+        return obj.retours.aggregate(total=Sum("quantite"))["total"] or Decimal("0")
+
+    def get_quantite_restante(self, obj):
+        return obj.quantite_recue - self.get_quantite_retournee(obj)
 
 
 def _appliquer_ligne_appro(appro, ligne):
@@ -696,13 +709,21 @@ def _calculer_montant_paye(mode, montant_paye_saisi, montant_total_calcule):
 
 def verifier_appro_modifiable(appro):
     """
-    Une réception ne peut être modifiée/supprimée QUE si aucun de ses
+    Une réception ne peut être modifiée/annulée QUE si aucun de ses
     produits n'a bougé depuis (autre réception, vente ou ajustement de
     stock plus récent) — sinon le CUMP et le stock actuels dépendent de
     mouvements qu'on ne peut plus démêler proprement. Lève une
     ValidationError explicite (nommant le produit) sinon, plutôt que de
-    risquer un stock/CUMP incohérent.
+    risquer un stock/CUMP incohérent. Refuse aussi si elle a déjà un
+    retour partiel (le stock actuel dépend alors aussi de ce retour, pas
+    seulement de la réception d'origine) ou si elle est déjà annulée.
     """
+    if appro.annulee:
+        raise serializers.ValidationError("Cette réception est déjà annulée.")
+    if appro.retours.exists():
+        raise serializers.ValidationError(
+            "Cette réception a déjà un retour partiel enregistré — impossible de la modifier ou de l'annuler."
+        )
     for ligne in appro.lignes.select_related("produit").all():
         produit = ligne.produit
         plus_recente_appro = (
@@ -881,15 +902,109 @@ class ApprovisionnementModificationSerializer(ApprovisionnementCreationSerialize
             return appro
 
 
+class LigneRetourApproEcritureSerializer(serializers.Serializer):
+    ligne_appro = serializers.PrimaryKeyRelatedField(queryset=LigneAppro.objects.all())
+    quantite = serializers.DecimalField(max_digits=10, decimal_places=3, min_value=Decimal("0.001"))
+
+
+class RetourApproCreationSerializer(serializers.Serializer):
+    """
+    POST /api/approvisionnements/<id>/retour/
+    {
+      "lignes": [{"ligne_appro": 12, "quantite": 2}],
+      "commentaire": "Marchandise abîmée"
+    }
+    Le contexte doit fournir "appro" (déjà verrouillée par la vue) et
+    "utilisateur". Contrairement à un retour de vente, pas de notion de
+    caisse/espèces — le retour réduit le stock et, au prorata de la part
+    à crédit d'origine, la dette envers ce fournisseur (voir create()).
+    """
+    lignes = LigneRetourApproEcritureSerializer(many=True)
+    commentaire = serializers.CharField(required=False, allow_blank=True, max_length=255)
+
+    def validate_lignes(self, value):
+        if not value:
+            raise serializers.ValidationError("Un retour doit contenir au moins une ligne.")
+        return value
+
+    def validate(self, data):
+        appro = self.context["appro"]
+        if appro.annulee:
+            raise serializers.ValidationError("Cette réception est annulée, aucun retour n'est possible.")
+        for ligne in data["lignes"]:
+            if ligne["ligne_appro"].appro_id != appro.pk:
+                raise serializers.ValidationError("Une des lignes indiquées n'appartient pas à cette réception.")
+        return data
+
+    def create(self, validated_data):
+        appro = self.context["appro"]
+        utilisateur = self.context["utilisateur"]
+
+        with transaction.atomic():
+            montant_total = Decimal("0")
+            lignes_pretes = []
+            for ligne in validated_data["lignes"]:
+                # select_for_update() verrouille la ligne le temps du
+                # calcul de la quantité déjà retournée, pour empêcher
+                # deux retours concurrents de dépasser la quantité reçue.
+                ligne_appro = LigneAppro.objects.select_for_update().get(pk=ligne["ligne_appro"].pk)
+                deja_retournee = ligne_appro.retours.aggregate(total=Sum("quantite"))["total"] or Decimal("0")
+                restante = ligne_appro.quantite_recue - deja_retournee
+                if ligne["quantite"] > restante:
+                    raise serializers.ValidationError(
+                        f"Impossible de retourner {ligne['quantite']} de {ligne_appro.produit.nom} "
+                        f"— il n'en reste que {restante} à retourner sur cette ligne."
+                    )
+                montant_ligne = ligne_appro.prix_unitaire_achat * ligne["quantite"]
+                montant_total += montant_ligne
+                lignes_pretes.append((ligne_appro, ligne["quantite"]))
+
+            retour = RetourAppro.objects.create(
+                appro=appro, utilisateur=utilisateur,
+                montant_total=montant_total, commentaire=validated_data.get("commentaire", ""),
+            )
+            for ligne_appro, quantite in lignes_pretes:
+                LigneRetourAppro.objects.create(retour=retour, ligne_appro=ligne_appro, quantite=quantite)
+                produit = Produit.objects.select_for_update().get(pk=ligne_appro.produit_id)
+                # Le stock diminue (la marchandise repart chez le
+                # fournisseur) — le CUMP n'est volontairement pas
+                # recalculé, même simplification que pour un retour
+                # client côté vente (RetourVenteCreationSerializer).
+                produit.quantite_stock = F("quantite_stock") - quantite
+                produit.save(update_fields=["quantite_stock"])
+
+            # Réduit la dette au prorata de la part à crédit d'origine de
+            # cette réception (0 si elle était payée comptant) — même
+            # logique que la part "mixte" de RetourVenteCreationSerializer.
+            if appro.montant_total > 0:
+                proportion_due = (appro.montant_total - appro.montant_paye) / appro.montant_total
+                montant_a_deduire = (montant_total * proportion_due).quantize(Decimal("0.01"))
+                if montant_a_deduire != 0:
+                    fournisseur = Fournisseur.objects.select_for_update().get(pk=appro.fournisseur_id)
+                    fournisseur.solde_du = F("solde_du") - montant_a_deduire
+                    fournisseur.save(update_fields=["solde_du"])
+
+            return retour
+
+
+class RetourApproLectureSerializer(serializers.ModelSerializer):
+    utilisateur_nom = serializers.StringRelatedField(source="utilisateur", read_only=True)
+
+    class Meta:
+        model = RetourAppro
+        fields = ["id", "appro", "utilisateur_nom", "date_heure", "montant_total", "commentaire"]
+
+
 class ApprovisionnementLectureSerializer(serializers.ModelSerializer):
     lignes = LigneApproLectureSerializer(many=True, read_only=True)
     fournisseur_nom = serializers.StringRelatedField(source="fournisseur", read_only=True)
+    retours = RetourApproLectureSerializer(many=True, read_only=True)
 
     class Meta:
         model = Approvisionnement
         fields = [
             "id", "date_reception", "fournisseur", "fournisseur_nom", "numero_facture", "lignes",
-            "montant_total", "mode_paiement", "montant_paye",
+            "montant_total", "mode_paiement", "montant_paye", "annulee", "retours",
         ]
 
 

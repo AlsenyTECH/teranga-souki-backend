@@ -6,7 +6,7 @@ from django.urls import path, include
 from .views import (
     CategorieViewSet, ProduitViewSet, ClientViewSet,
     FournisseurViewSet, ServiceViewSet, ConnexionView, VenteView,
-    ApprovisionnementView, ApprovisionnementDetailView, PrestationView, DepenseViewSet, RapportJournalierView,
+    ApprovisionnementView, ApprovisionnementDetailView, RetourApproView, PrestationView, DepenseViewSet, RapportJournalierView,
     RapportPeriodeView, RoleViewSet, UtilisateurListCreateView,
     UtilisateurPermissionsView, UtilisateurDetailView, MonProfilView,
     AjustementStockView, AnnulerVenteView, RemboursementCreditView, PaiementFournisseurView,
@@ -32,6 +32,7 @@ urlpatterns = [
     path("ventes/<int:pk>/retour/", RetourVenteView.as_view(), name="retour-vente"),
     path("approvisionnements/", ApprovisionnementView.as_view(), name="approvisionnements"),
     path("approvisionnements/<int:pk>/", ApprovisionnementDetailView.as_view(), name="approvisionnement-detail"),
+    path("approvisionnements/<int:pk>/retour/", RetourApproView.as_view(), name="retour-appro"),
     path("prestations/", PrestationView.as_view(), name="prestations"),
     path("rapports/", RapportJournalierView.as_view(), name="rapports"),
     path("rapports/periode/", RapportPeriodeView.as_view(), name="rapport-periode"),

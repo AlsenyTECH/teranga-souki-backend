@@ -21,6 +21,7 @@ from .serializers import (
     VenteCreationSerializer, TransactionCaisseLectureSerializer,
     ApprovisionnementCreationSerializer, ApprovisionnementLectureSerializer,
     ApprovisionnementModificationSerializer, verifier_appro_modifiable, inverser_effet_appro,
+    RetourApproCreationSerializer,
     PrestationCreationSerializer, PrestationLectureSerializer,
     DepenseSerializer, RoleSerializer, UtilisateurSerializer, UtilisateurCreationSerializer,
     AjustementStockCreationSerializer, AjustementStockLectureSerializer,
@@ -176,9 +177,12 @@ class ApprovisionnementDetailView(APIView):
     """
     PATCH/DELETE /api/approvisionnements/<pk>/ — corrige ou annule une
     réception saisie par erreur. Refuse (400) si l'un de ses produits a
-    bougé depuis (voir serializers.verifier_appro_modifiable) : le CUMP
-    et le stock actuels dépendraient alors de mouvements postérieurs
-    qu'on ne peut plus démêler proprement.
+    bougé depuis, si elle a déjà un retour, ou si elle est déjà annulée
+    (voir serializers.verifier_appro_modifiable) : le CUMP et le stock
+    actuels dépendraient alors de mouvements qu'on ne peut plus démêler
+    proprement. DELETE annule (garde la ligne, marque annulee=True,
+    défait son effet) plutôt que de supprimer réellement la ligne — même
+    logique d'audit que TransactionCaisse.annulee côté vente.
     """
     permission_classes = [PeutGererApprovisionnement]
 
@@ -199,8 +203,31 @@ class ApprovisionnementDetailView(APIView):
             appro = Approvisionnement.objects.select_for_update().get(pk=appro.pk)
             verifier_appro_modifiable(appro)
             inverser_effet_appro(appro)
-            appro.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
+            appro.annulee = True
+            appro.save(update_fields=["annulee"])
+        out = ApprovisionnementLectureSerializer(appro)
+        return Response(out.data)
+
+
+class RetourApproView(APIView):
+    """
+    POST /api/approvisionnements/<pk>/retour/ — retour partiel de
+    marchandise au fournisseur (miroir de RetourVenteView côté achats).
+    """
+    permission_classes = [PeutGererApprovisionnement]
+
+    def post(self, request, pk):
+        with transaction.atomic():
+            appro = get_object_or_404(Approvisionnement.objects.select_for_update(), pk=pk)
+            serializer = RetourApproCreationSerializer(
+                data=request.data,
+                context={"appro": appro, "utilisateur": request.user.utilisateur},
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+        appro.refresh_from_db()
+        out = ApprovisionnementLectureSerializer(appro)
+        return Response(out.data, status=status.HTTP_201_CREATED)
 
 
 class PrestationView(APIView):

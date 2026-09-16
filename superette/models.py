@@ -340,6 +340,10 @@ class Approvisionnement(models.Model):
     montant_paye = models.DecimalField(
         max_digits=10, decimal_places=2, default=0, validators=[MinValueValidator(0)]
     )
+    # NOUVEAU : miroir de TransactionCaisse.annulee — annuler une
+    # réception défait son effet (stock, CUMP, dette fournisseur) mais
+    # garde la ligne pour l'historique/audit, plutôt qu'un DELETE dur.
+    annulee = models.BooleanField(default=False)
 
     def __str__(self):
         return f"Appro #{self.pk} - {self.fournisseur}"
@@ -364,6 +368,33 @@ class LigneAppro(models.Model):
 
     def __str__(self):
         return f"{self.quantite_recue} x {self.produit}"
+
+
+class RetourAppro(models.Model):
+    """
+    Retour (partiel) de marchandise à un fournisseur — miroir de
+    RetourVente côté achats : la réception d'origine reste intacte,
+    ce retour lui est simplement rattaché. Contrairement à une vente,
+    pas de notion de caisse/espèces ici : le retour réduit uniquement
+    le stock et, au prorata, la dette envers ce fournisseur.
+    """
+    appro = models.ForeignKey(Approvisionnement, on_delete=models.PROTECT, related_name="retours")
+    utilisateur = models.ForeignKey(Utilisateur, on_delete=models.PROTECT)
+    date_heure = models.DateTimeField(auto_now_add=True)
+    montant_total = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0.01)])
+    commentaire = models.CharField(max_length=255, blank=True)
+
+    def __str__(self):
+        return f"Retour #{self.pk} sur appro #{self.appro_id}"
+
+
+class LigneRetourAppro(models.Model):
+    retour = models.ForeignKey(RetourAppro, on_delete=models.CASCADE, related_name="lignes")
+    ligne_appro = models.ForeignKey(LigneAppro, on_delete=models.PROTECT, related_name="retours")
+    quantite = models.DecimalField(max_digits=10, decimal_places=3, validators=[MinValueValidator(0.001)])
+
+    def __str__(self):
+        return f"{self.quantite} x {self.ligne_appro.produit} (retour fournisseur)"
 
 
 class TypeRecurrence(models.TextChoices):
