@@ -25,7 +25,10 @@ class UtilisateurSerializer(serializers.ModelSerializer):
         # Liste EXPLICITE des champs exposés — jamais fields = "__all__"
         # sur un modèle contenant un mot de passe : mot_de_passe_hash
         # ne doit JAMAIS apparaître dans une réponse JSON.
-        fields = ["id", "nom", "telephone", "username", "role", "actif", "date_creation", "permissions_supplementaires"]
+        fields = [
+            "id", "nom", "telephone", "username", "role", "actif", "date_creation",
+            "permissions_supplementaires", "est_compte_principal",
+        ]
         read_only_fields = ["date_creation"]
 
 

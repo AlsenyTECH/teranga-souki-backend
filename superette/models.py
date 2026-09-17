@@ -31,6 +31,12 @@ class Utilisateur(models.Model):
     role = models.ForeignKey(Role, on_delete=models.PROTECT)
     actif = models.BooleanField(default=True)
     date_creation = models.DateTimeField(auto_now_add=True)
+    # NOUVEAU : le compte du patron principal (unique, jamais plusieurs)
+    # ne peut jamais être supprimé — évite qu'un admin se retrouve sans
+    # accès à sa propre superette par erreur ou malveillance d'un autre
+    # compte admin. Un flag plutôt qu'un nom en dur : robuste à un
+    # changement d'identifiant/nom plus tard.
+    est_compte_principal = models.BooleanField(default=False)
     # Permissions accordées EN PLUS du rôle de base — n'a de sens que
     # pour un caissier (un admin a déjà tout). Liste de clés parmi :
     # catalogue, fournisseurs, approvisionnement, clients, depenses,

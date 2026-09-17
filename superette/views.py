@@ -9,6 +9,7 @@ from rest_framework.views import APIView
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from django.db import transaction
+from django.db.models import ProtectedError
 
 from .models import (
     Categorie, Produit, Client, Fournisseur, Service, TransactionCaisse, Approvisionnement,
@@ -648,6 +649,37 @@ class UtilisateurDetailView(APIView):
             utilisateur.compte.save()
 
         return Response(UtilisateurSerializer(utilisateur).data)
+
+    def delete(self, request, pk):
+        try:
+            utilisateur = Utilisateur.objects.select_related("compte").get(pk=pk)
+        except Utilisateur.DoesNotExist:
+            return Response({"detail": "Compte introuvable."}, status=status.HTTP_404_NOT_FOUND)
+
+        if utilisateur.est_compte_principal:
+            return Response(
+                {"detail": "Le compte du patron principal ne peut pas être supprimé."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            with transaction.atomic():
+                # CASCADE depuis compte (voir Utilisateur.compte) : supprime
+                # le profil métier avec le compte de connexion.
+                utilisateur.compte.delete()
+            return Response({"action": "supprime"})
+        except ProtectedError:
+            # Ce compte a déjà de l'activité enregistrée (ventes, sessions
+            # de caisse, ajustements...) — les nombreuses FK PROTECT vers
+            # Utilisateur empêchent une suppression réelle sans perdre la
+            # traçabilité de cet historique. Repli sur une désactivation
+            # (bloque la connexion, garde tout l'historique intact) — même
+            # principe que ProduitsBody.tsx pour un produit déjà utilisé.
+            utilisateur.compte.is_active = False
+            utilisateur.compte.save(update_fields=["is_active"])
+            utilisateur.actif = False
+            utilisateur.save(update_fields=["actif"])
+            return Response({"action": "desactive", "utilisateur": UtilisateurSerializer(utilisateur).data})
 
 
 class MonProfilView(APIView):
