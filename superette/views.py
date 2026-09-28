@@ -662,6 +662,12 @@ class UtilisateurDetailView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        if utilisateur.compte_id == request.user.id:
+            return Response(
+                {"detail": "Tu ne peux pas supprimer ton propre compte — demande à un autre admin."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         try:
             with transaction.atomic():
                 # CASCADE depuis compte (voir Utilisateur.compte) : supprime
