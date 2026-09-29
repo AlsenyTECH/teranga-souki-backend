@@ -58,7 +58,20 @@ class LectureAdminEcritureAdmin(BasePermission):
 
 CLES_PERMISSIONS_VALIDES = [
     "catalogue", "fournisseurs", "approvisionnement", "clients", "depenses", "rapports",
+    # "remises" : autorise un caissier à modifier le prix d'une ligne à la
+    # caisse et à accorder une réduction. Sans elle, le serveur applique
+    # toujours le prix catalogue (détail/gros) et refuse toute réduction.
+    "remises",
 ]
+
+
+def peut_accorder_remises(utilisateur):
+    """True pour un admin, ou un caissier ayant reçu la permission "remises"."""
+    if utilisateur is None:
+        return False
+    if utilisateur.role_id == "admin":
+        return True
+    return "remises" in (utilisateur.permissions_supplementaires or [])
 
 
 def _a_permission(request, cle):

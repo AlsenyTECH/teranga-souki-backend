@@ -5,7 +5,7 @@ from rest_framework.routers import DefaultRouter
 from django.urls import path, include
 from .views import (
     CategorieViewSet, ProduitViewSet, ClientViewSet,
-    FournisseurViewSet, ServiceViewSet, ConnexionView, VenteView,
+    FournisseurViewSet, ServiceViewSet, ConnexionView, DeconnexionView, VenteView,
     ApprovisionnementView, ApprovisionnementDetailView, RetourApproView, PrestationView, DepenseViewSet, RapportJournalierView,
     RapportPeriodeView, RoleViewSet, UtilisateurListCreateView,
     UtilisateurPermissionsView, UtilisateurDetailView, MonProfilView,
@@ -27,6 +27,7 @@ router.register("roles", RoleViewSet)
 
 urlpatterns = [
     path("connexion/", ConnexionView.as_view(), name="connexion"),
+    path("deconnexion/", DeconnexionView.as_view(), name="deconnexion"),
     path("ventes/", VenteView.as_view(), name="ventes"),
     path("ventes/<int:pk>/annuler/", AnnulerVenteView.as_view(), name="annuler-vente"),
     path("ventes/<int:pk>/retour/", RetourVenteView.as_view(), name="retour-vente"),

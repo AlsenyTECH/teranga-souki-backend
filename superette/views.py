@@ -9,7 +9,9 @@ from rest_framework.views import APIView
 from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from django.db import transaction
-from django.db.models import ProtectedError
+from django.db.models import ProtectedError, Sum, F, Value, Case, When, DecimalField
+from django.db.models.functions import Coalesce
+from rest_framework.permissions import IsAuthenticated
 
 from .models import (
     Categorie, Produit, Client, Fournisseur, Service, TransactionCaisse, Approvisionnement,
@@ -31,9 +33,10 @@ from .serializers import (
     ArchiveCreanceClientSerializer, ArchiveCreanceFournisseurSerializer,
     PaiementFournisseurSerializer, PaiementFournisseurLectureSerializer,
     SessionCaisseOuvertureSerializer, SessionCaisseFermetureSerializer,
-    SessionCaisseLectureSerializer, calculer_totaux_session,
+    SessionCaisseLectureSerializer, calculer_totaux_session, part_especes,
     RetourVenteCreationSerializer, RetourVenteLectureSerializer,
 )
+from .pagination import StandardPagination
 from .permissions import (
     LectureAdminEcritureAdmin, EstCaissierOuAdmin, EstAdmin,
     PeutGererCatalogue, PeutGererFournisseurs, PeutGererClients,
@@ -41,7 +44,45 @@ from .permissions import (
 )
 
 
-class CategorieViewSet(viewsets.ModelViewSet):
+class SuppressionProtegeeMixin:
+    """DELETE sur un élément déjà référencé (produit vendu, client avec
+    historique...) : 400 explicite au lieu d'une erreur 500 ProtectedError."""
+
+    def destroy(self, request, *args, **kwargs):
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response(
+                {"detail": "Impossible de supprimer : cet élément est déjà utilisé dans l'historique "
+                           "(ventes, réceptions...). Désactive-le ou garde-le."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+
+def filtrer_par_dates(qs, request, champ):
+    """?date_debut=AAAA-MM-JJ&date_fin=AAAA-MM-JJ (bornes incluses, chacune
+    optionnelle) — pour ne plus renvoyer tout l'historique à chaque écran."""
+    debut = request.query_params.get("date_debut")
+    fin = request.query_params.get("date_fin")
+    if debut:
+        qs = qs.filter(**{f"{champ}__date__gte": parse_date(debut, "date_debut")})
+    if fin:
+        qs = qs.filter(**{f"{champ}__date__lte": parse_date(fin, "date_fin")})
+    return qs
+
+
+def reponse_liste(request, view, qs, serializer_class):
+    """Même contrat que StandardPagination pour les APIView : liste complète
+    par défaut (rétrocompatible), page {count, next, previous, results}
+    dès que ?page ou ?page_size est fourni."""
+    paginator = StandardPagination()
+    page = paginator.paginate_queryset(qs, request, view=view)
+    if page is not None:
+        return paginator.get_paginated_response(serializer_class(page, many=True).data)
+    return Response(serializer_class(qs, many=True).data)
+
+
+class CategorieViewSet(SuppressionProtegeeMixin, viewsets.ModelViewSet):
     # ModelViewSet donne automatiquement les 5 actions REST standard :
     # list (GET /categories/), retrieve (GET /categories/1/),
     # create (POST), update (PUT/PATCH), destroy (DELETE)
@@ -50,7 +91,7 @@ class CategorieViewSet(viewsets.ModelViewSet):
     permission_classes = [PeutGererCatalogue]
 
 
-class ProduitViewSet(viewsets.ModelViewSet):
+class ProduitViewSet(SuppressionProtegeeMixin, viewsets.ModelViewSet):
     # Par défaut, ne montre QUE les produits actifs (comportement
     # correct pour la caisse : jamais vendre un produit désactivé).
     # Le paramètre ?tous=1 lève ce filtre — utilisé par la page
@@ -83,19 +124,19 @@ class ProduitViewSet(viewsets.ModelViewSet):
         return qs
 
 
-class ClientViewSet(viewsets.ModelViewSet):
+class ClientViewSet(SuppressionProtegeeMixin, viewsets.ModelViewSet):
     queryset = Client.objects.all()
     serializer_class = ClientSerializer
     permission_classes = [PeutGererClients]
 
 
-class FournisseurViewSet(viewsets.ModelViewSet):
+class FournisseurViewSet(SuppressionProtegeeMixin, viewsets.ModelViewSet):
     queryset = Fournisseur.objects.all()
     serializer_class = FournisseurSerializer
     permission_classes = [PeutGererFournisseurs]
 
 
-class ServiceViewSet(viewsets.ModelViewSet):
+class ServiceViewSet(SuppressionProtegeeMixin, viewsets.ModelViewSet):
     queryset = Service.objects.all()
     serializer_class = ServiceSerializer
     permission_classes = [LectureAdminEcritureAdmin]
@@ -127,20 +168,27 @@ class VenteView(APIView):
         return Response(out.data, status=status.HTTP_201_CREATED)
 
     def get(self, request):
-        # Bonus : lister les ventes du jour, utile pour l'écran caisse
         qs = TransactionCaisse.objects.filter(
             venteproduits__isnull=False
-        ).select_related("utilisateur", "client").prefetch_related(
-            "venteproduits__lignes__produit", "retours__lignes", "paiements",
-        )
+        ).select_related("utilisateur", "client", "venteproduits").prefetch_related(
+            "venteproduits__lignes__produit", "venteproduits__lignes__retours", "retours", "paiements",
+        ).order_by("-date_heure")
         # ?client=<id> : historique des ventes d'un client précis, pour
         # sa fiche détail (Flutter fusionne ce résultat avec ses
         # remboursements de crédit pour construire une timeline unique).
         client_id = request.query_params.get("client")
         if client_id:
             qs = qs.filter(client_id=client_id)
-        serializer = TransactionCaisseLectureSerializer(qs, many=True)
-        return Response(serializer.data)
+        # Un caissier ne voit que SES ventes — sauf la fiche d'un client
+        # s'il a reçu la permission "clients", où l'historique complet du
+        # client est justement l'objet de l'écran.
+        utilisateur = request.user.utilisateur
+        if utilisateur.role_id != "admin":
+            voit_client = client_id and "clients" in (utilisateur.permissions_supplementaires or [])
+            if not voit_client:
+                qs = qs.filter(utilisateur=utilisateur)
+        qs = filtrer_par_dates(qs, request, "date_heure")
+        return reponse_liste(request, self, qs, TransactionCaisseLectureSerializer)
 
 
 class ApprovisionnementView(APIView):
@@ -164,14 +212,16 @@ class ApprovisionnementView(APIView):
         return Response(out.data, status=status.HTTP_201_CREATED)
 
     def get(self, request):
-        qs = Approvisionnement.objects.select_related("fournisseur").prefetch_related("lignes__produit")
+        qs = Approvisionnement.objects.select_related("fournisseur").prefetch_related(
+            "lignes__produit", "lignes__retours", "retours__utilisateur",
+        ).order_by("-date_reception")
         # ?fournisseur=<id> : historique des réceptions d'un fournisseur
         # précis, pour sa fiche détail.
         fournisseur_id = request.query_params.get("fournisseur")
         if fournisseur_id:
             qs = qs.filter(fournisseur_id=fournisseur_id)
-        serializer = ApprovisionnementLectureSerializer(qs, many=True)
-        return Response(serializer.data)
+        qs = filtrer_par_dates(qs, request, "date_reception")
+        return reponse_liste(request, self, qs, ApprovisionnementLectureSerializer)
 
 
 class ApprovisionnementDetailView(APIView):
@@ -251,12 +301,14 @@ class PrestationView(APIView):
     def get(self, request):
         qs = TransactionCaisse.objects.filter(
             prestationservice__isnull=False
-        ).select_related("utilisateur", "client", "prestationservice__service")
-        serializer = PrestationLectureSerializer(qs, many=True)
-        return Response(serializer.data)
+        ).select_related("utilisateur", "client", "prestationservice__service").order_by("-date_heure")
+        if request.user.utilisateur.role_id != "admin":
+            qs = qs.filter(utilisateur=request.user.utilisateur)
+        qs = filtrer_par_dates(qs, request, "date_heure")
+        return reponse_liste(request, self, qs, PrestationLectureSerializer)
 
 
-class DepenseViewSet(viewsets.ModelViewSet):
+class DepenseViewSet(SuppressionProtegeeMixin, viewsets.ModelViewSet):
     queryset = Depense.objects.select_related("utilisateur").all()
     serializer_class = DepenseSerializer
     permission_classes = [PeutGererDepenses]
@@ -278,7 +330,12 @@ from datetime import date as date_cls, timedelta
 from django.db.models import Sum, F, DecimalField, ExpressionWrapper
 from django.db.models.functions import Coalesce, TruncDate
 from django.db import transaction
-from .models import LigneVente, Depense as DepenseModel, AjustementStock, ModePaiement
+from decimal import Decimal
+from rest_framework.exceptions import ValidationError
+from .models import (
+    LigneVente, Depense as DepenseModel, AjustementStock, ModePaiement,
+    RetourVente, LigneRetour, VenteProduits, PaiementVente,
+)
 
 
 def evolution_pct(actuel, ancien):
@@ -291,64 +348,103 @@ def evolution_pct(actuel, ancien):
     return round((actuel - ancien) / ancien * 100, 1)
 
 
+def parse_date(valeur, nom):
+    """Date ISO (YYYY-MM-DD) d'un paramètre de requête, ou 400 explicite —
+    jamais une erreur 500 sur une date mal formée (ex: ?date=2026-13-01)."""
+    try:
+        return date_cls.fromisoformat(valeur)
+    except (TypeError, ValueError):
+        raise ValidationError({nom: "Format de date invalide (attendu : AAAA-MM-JJ)."})
+
+
+def calculer_totaux_periode(debut, fin):
+    """
+    Totaux financiers entre deux dates incluses — partagé entre le rapport
+    journalier et le rapport de période, pour que les deux donnent toujours
+    les mêmes chiffres pour le même jour.
+
+    - Chiffre d'affaires ventes = encaissé (réductions déjà déduites) MOINS
+      les retours enregistrés sur la période (un retour réduit le CA du jour
+      où il a lieu, pas celui de la vente d'origine).
+    - Marge = Σ (prix - CUMP actuel) x quantité, moins les réductions
+      accordées, moins la marge rendue par les retours. Approximation
+      assumée : CUMP actuel, pas celui du jour de la vente (non historisé).
+    """
+    transactions = TransactionCaisse.objects.filter(
+        date_heure__date__gte=debut, date_heure__date__lte=fin, annulee=False
+    )
+    ventes_qs = transactions.filter(venteproduits__isnull=False)
+    prestations_qs = transactions.filter(prestationservice__isnull=False)
+
+    ca_ventes_brut = ventes_qs.aggregate(total=Coalesce(Sum("montant_total"), 0, output_field=DecimalField()))["total"]
+    ca_prestations = prestations_qs.aggregate(total=Coalesce(Sum("montant_total"), 0, output_field=DecimalField()))["total"]
+
+    retours_qs = RetourVente.objects.filter(
+        date_heure__date__gte=debut, date_heure__date__lte=fin, vente__annulee=False
+    )
+    total_retours = retours_qs.aggregate(total=Coalesce(Sum("montant_total"), 0, output_field=DecimalField()))["total"]
+    ca_ventes = ca_ventes_brut - total_retours
+
+    marge_expr = ExpressionWrapper(
+        (F("prix_unitaire_vente") - F("produit__prix_achat_moyen")) * F("quantite"),
+        output_field=DecimalField(max_digits=14, decimal_places=5),
+    )
+    marge_lignes = LigneVente.objects.filter(
+        vente__transaction__date_heure__date__gte=debut,
+        vente__transaction__date_heure__date__lte=fin,
+        vente__transaction__annulee=False,
+    ).aggregate(total=Coalesce(Sum(marge_expr), 0, output_field=DecimalField()))["total"]
+    total_reductions = VenteProduits.objects.filter(transaction__in=ventes_qs).aggregate(
+        total=Coalesce(Sum("reduction_montant"), 0, output_field=DecimalField())
+    )["total"]
+    cout_retours = LigneRetour.objects.filter(retour__in=retours_qs).aggregate(
+        total=Coalesce(
+            Sum(ExpressionWrapper(
+                F("quantite") * F("ligne_vente__produit__prix_achat_moyen"),
+                output_field=DecimalField(max_digits=14, decimal_places=5),
+            )),
+            0, output_field=DecimalField(),
+        )
+    )["total"]
+    marge = marge_lignes - total_reductions - (total_retours - cout_retours)
+
+    total_depenses = DepenseModel.objects.filter(
+        date_depense__gte=debut, date_depense__lte=fin
+    ).aggregate(total=Coalesce(Sum("montant"), 0, output_field=DecimalField()))["total"]
+
+    chiffre_affaires_total = ca_ventes + ca_prestations
+    deux = Decimal("0.01")
+    return {
+        "transactions": transactions,
+        "ventes_qs": ventes_qs,
+        "chiffre_affaires_ventes": Decimal(ca_ventes).quantize(deux),
+        "chiffre_affaires_prestations": Decimal(ca_prestations).quantize(deux),
+        "chiffre_affaires_total": Decimal(chiffre_affaires_total).quantize(deux),
+        "retours_ventes": Decimal(total_retours).quantize(deux),
+        "reductions_accordees": Decimal(total_reductions).quantize(deux),
+        "marge_brute_ventes": Decimal(marge).quantize(deux),
+        "total_depenses": Decimal(total_depenses).quantize(deux),
+        "resultat_net": Decimal(chiffre_affaires_total - total_depenses).quantize(deux),
+    }
+
+
+def _sans_querysets(totaux):
+    return {k: v for k, v in totaux.items() if k not in ("transactions", "ventes_qs")}
+
+
 class RapportJournalierView(APIView):
     """
     GET /api/rapports/?date=2026-08-16   (date optionnelle, défaut = aujourd'hui)
     """
     permission_classes = [PeutVoirRapports]
 
-    def _totaux_jour(self, jour):
-        transactions_du_jour = TransactionCaisse.objects.filter(
-            date_heure__date=jour, annulee=False
-        )
-
-        # Coalesce(Sum(...), 0) : Sum() renvoie None si aucune ligne ne
-        # correspond (ex: aucune vente ce jour-là) — Coalesce remplace
-        # ce None par 0, pour éviter un calcul cassé plus bas (None - 500).
-        ca_ventes = transactions_du_jour.filter(venteproduits__isnull=False).aggregate(
-            total=Coalesce(Sum("montant_total"), 0, output_field=DecimalField())
-        )["total"]
-
-        ca_prestations = transactions_du_jour.filter(prestationservice__isnull=False).aggregate(
-            total=Coalesce(Sum("montant_total"), 0, output_field=DecimalField())
-        )["total"]
-
-        total_depenses = DepenseModel.objects.filter(date_depense=jour).aggregate(
-            total=Coalesce(Sum("montant"), 0, output_field=DecimalField())
-        )["total"]
-
-        # Marge sur les ventes de produits : (prix de vente appliqué -
-        # prix d'achat moyen ACTUEL du produit) x quantité. Approximation
-        # assumée : on utilise le CUMP d'AUJOURD'HUI, pas celui du jour
-        # de la vente (qu'on ne conserve pas en historique) — cohérent
-        # avec le compromis "simple" qu'on avait choisi au chapitre 4.
-        marge_expr = ExpressionWrapper(
-            (F("prix_unitaire_vente") - F("produit__prix_achat_moyen")) * F("quantite"),
-            output_field=DecimalField(max_digits=12, decimal_places=2),
-        )
-        marge_ventes = LigneVente.objects.filter(
-            vente__transaction__date_heure__date=jour,
-            vente__transaction__annulee=False,
-        ).aggregate(total=Coalesce(Sum(marge_expr), 0, output_field=DecimalField()))["total"]
-
-        chiffre_affaires = ca_ventes + ca_prestations
-        resultat_net = chiffre_affaires - total_depenses
-
-        return {
-            "chiffre_affaires_ventes": ca_ventes,
-            "chiffre_affaires_prestations": ca_prestations,
-            "chiffre_affaires_total": chiffre_affaires,
-            "marge_brute_ventes": marge_ventes,
-            "total_depenses": total_depenses,
-            "resultat_net": resultat_net,
-        }
-
     def get(self, request):
         date_param = request.query_params.get("date")
-        jour = date_cls.fromisoformat(date_param) if date_param else timezone.localdate()
+        jour = parse_date(date_param, "date") if date_param else timezone.localdate()
 
-        totaux = self._totaux_jour(jour)
-        totaux_veille = self._totaux_jour(jour - timedelta(days=1))
+        totaux = _sans_querysets(calculer_totaux_periode(jour, jour))
+        veille = jour - timedelta(days=1)
+        totaux_veille = _sans_querysets(calculer_totaux_periode(veille, veille))
 
         # Produits les plus vendus du jour (top 5)
         top_produits = (
@@ -408,11 +504,8 @@ class RapportPeriodeView(APIView):
                 {"detail": "Paramètres 'debut' et 'fin' requis (format YYYY-MM-DD)."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        try:
-            debut = date_cls.fromisoformat(debut_str)
-            fin = date_cls.fromisoformat(fin_str)
-        except ValueError:
-            return Response({"detail": "Format de date invalide."}, status=status.HTTP_400_BAD_REQUEST)
+        debut = parse_date(debut_str, "debut")
+        fin = parse_date(fin_str, "fin")
         if fin < debut:
             return Response({"detail": "La date de fin doit être après la date de début."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -424,7 +517,7 @@ class RapportPeriodeView(APIView):
         duree = (fin - debut).days + 1
         debut_precedent = debut - timedelta(days=duree)
         fin_precedent = debut - timedelta(days=1)
-        precedent = self._calculer(debut_precedent, fin_precedent)
+        precedent = _sans_querysets(calculer_totaux_periode(debut_precedent, fin_precedent))
 
         donnees["comparaison"] = {
             "chiffre_affaires_precedent": precedent["chiffre_affaires_total"],
@@ -453,50 +546,37 @@ class RapportPeriodeView(APIView):
         return Response(donnees)
 
     def _calculer(self, debut, fin):
-        transactions = TransactionCaisse.objects.filter(
-            date_heure__date__gte=debut, date_heure__date__lte=fin, annulee=False
-        )
-        ventes_qs = transactions.filter(venteproduits__isnull=False)
-        prestations_qs = transactions.filter(prestationservice__isnull=False)
-
-        ca_ventes = ventes_qs.aggregate(total=Coalesce(Sum("montant_total"), 0, output_field=DecimalField()))["total"]
-        ca_prestations = prestations_qs.aggregate(total=Coalesce(Sum("montant_total"), 0, output_field=DecimalField()))["total"]
+        totaux = calculer_totaux_periode(debut, fin)
+        transactions = totaux["transactions"]
+        ventes_qs = totaux["ventes_qs"]
         nb_transactions = transactions.count()
         nb_ventes = ventes_qs.count()
-
-        marge_expr = ExpressionWrapper(
-            (F("prix_unitaire_vente") - F("produit__prix_achat_moyen")) * F("quantite"),
-            output_field=DecimalField(max_digits=12, decimal_places=2),
-        )
-        marge = LigneVente.objects.filter(
-            vente__transaction__date_heure__date__gte=debut,
-            vente__transaction__date_heure__date__lte=fin,
-            vente__transaction__annulee=False,
-        ).aggregate(total=Coalesce(Sum(marge_expr), 0, output_field=DecimalField()))["total"]
-
-        total_depenses = DepenseModel.objects.filter(
-            date_depense__gte=debut, date_depense__lte=fin
-        ).aggregate(total=Coalesce(Sum("montant"), 0, output_field=DecimalField()))["total"]
-
-        chiffre_affaires_total = ca_ventes + ca_prestations
-        resultat_net = chiffre_affaires_total - total_depenses
+        ca_ventes = totaux["chiffre_affaires_ventes"]
         panier_moyen = round(float(ca_ventes) / nb_ventes, 2) if nb_ventes > 0 else 0
 
         # Répartition par mode de paiement — utile pour anticiper les
         # besoins de monnaie/liquidités et suivre l'adoption du mobile money.
-        repartition_paiement = {
-            mode: transactions.filter(mode_paiement=mode).aggregate(
+        # Une vente mixte est ventilée sur ses modes réels (espèces, Wave...)
+        # au lieu d'apparaître dans une catégorie "mixte" opaque.
+        repartition_paiement = {}
+        for mode, _ in ModePaiement.choices:
+            if mode == ModePaiement.MIXTE:
+                continue
+            direct = transactions.filter(mode_paiement=mode).aggregate(
                 total=Coalesce(Sum("montant_total"), 0, output_field=DecimalField())
             )["total"]
-            for mode, _ in ModePaiement.choices
-        }
+            via_mixte = PaiementVente.objects.filter(
+                vente__in=transactions.filter(mode_paiement=ModePaiement.MIXTE), mode_paiement=mode
+            ).aggregate(total=Coalesce(Sum("montant"), 0, output_field=DecimalField()))["total"]
+            repartition_paiement[mode] = direct + via_mixte
 
+        lignes_periode = LigneVente.objects.filter(
+            vente__transaction__date_heure__date__gte=debut,
+            vente__transaction__date_heure__date__lte=fin,
+            vente__transaction__annulee=False,
+        )
         top_produits = list(
-            LigneVente.objects.filter(
-                vente__transaction__date_heure__date__gte=debut,
-                vente__transaction__date_heure__date__lte=fin,
-                vente__transaction__annulee=False,
-            )
+            lignes_periode
             .values("produit__nom")
             .annotate(quantite_totale=Sum("quantite"),
                       chiffre_affaires=Sum(F("quantite") * F("prix_unitaire_vente")))
@@ -504,27 +584,17 @@ class RapportPeriodeView(APIView):
         )
 
         # Répartition du chiffre d'affaires par catégorie de produit —
-        # matière première du graphique donut côté app (chaque Produit a
-        # une catégorie obligatoire, donc aucune ligne ne tombe hors
-        # regroupement ici, contrairement à depenses_par_categorie qui
-        # est une simple chaîne libre).
+        # matière première du graphique donut côté app.
         ventes_par_categorie = list(
-            LigneVente.objects.filter(
-                vente__transaction__date_heure__date__gte=debut,
-                vente__transaction__date_heure__date__lte=fin,
-                vente__transaction__annulee=False,
-            )
+            lignes_periode
             .values(categorie=F("produit__categorie__libelle"))
             .annotate(chiffre_affaires=Sum(F("quantite") * F("prix_unitaire_vente")))
             .order_by("-chiffre_affaires")
         )
 
-        # Produits actifs n'ayant fait l'objet d'AUCUNE vente sur la
-        # période — signal utile pour repérer le stock qui dort.
-        produits_vendus_ids = LigneVente.objects.filter(
-            vente__transaction__date_heure__date__gte=debut,
-            vente__transaction__date_heure__date__lte=fin,
-        ).values_list("produit_id", flat=True).distinct()
+        # Produits actifs n'ayant fait l'objet d'AUCUNE vente (non annulée)
+        # sur la période — signal utile pour repérer le stock qui dort.
+        produits_vendus_ids = lignes_periode.values_list("produit_id", flat=True).distinct()
         produits_invendus = list(
             Produit.objects.filter(actif=True)
             .exclude(id__in=produits_vendus_ids)
@@ -549,14 +619,9 @@ class RapportPeriodeView(APIView):
 
         return {
             "periode": {"debut": debut.isoformat(), "fin": fin.isoformat()},
-            "chiffre_affaires_ventes": ca_ventes,
-            "chiffre_affaires_prestations": ca_prestations,
-            "chiffre_affaires_total": chiffre_affaires_total,
+            **_sans_querysets(totaux),
             "nombre_transactions": nb_transactions,
             "panier_moyen": panier_moyen,
-            "marge_brute_ventes": marge,
-            "total_depenses": total_depenses,
-            "resultat_net": resultat_net,
             "repartition_paiement": repartition_paiement,
             "top_produits": top_produits,
             "ventes_par_categorie": ventes_par_categorie,
@@ -630,6 +695,15 @@ class UtilisateurDetailView(APIView):
         except Utilisateur.DoesNotExist:
             return Response({"detail": "Compte introuvable."}, status=status.HTTP_404_NOT_FOUND)
 
+        # Le compte du patron principal ne se modifie que par lui-même (via
+        # /mon-profil/) : sinon n'importe quel autre admin pourrait changer
+        # son mot de passe ou son identifiant et lui prendre la superette.
+        if utilisateur.est_compte_principal and utilisateur.compte_id != request.user.id:
+            return Response(
+                {"detail": "Le compte du patron principal ne peut être modifié que par lui-même."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         serializer = UtilisateurEditionSerializer(instance=utilisateur, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -647,6 +721,10 @@ class UtilisateurDetailView(APIView):
             utilisateur.compte.set_password(nouveau_mdp)
         if "username" in data or nouveau_mdp:
             utilisateur.compte.save()
+        if nouveau_mdp:
+            # Nouveau mot de passe = toutes les sessions ouvertes de ce compte
+            # sont coupées (ex: mot de passe volé, employé qui part).
+            Token.objects.filter(user=utilisateur.compte).delete()
 
         return Response(UtilisateurSerializer(utilisateur).data)
 
@@ -683,6 +761,7 @@ class UtilisateurDetailView(APIView):
             # principe que ProduitsBody.tsx pour un produit déjà utilisé.
             utilisateur.compte.is_active = False
             utilisateur.compte.save(update_fields=["is_active"])
+            Token.objects.filter(user=utilisateur.compte).delete()
             utilisateur.actif = False
             utilisateur.save(update_fields=["actif"])
             return Response({"action": "desactive", "utilisateur": UtilisateurSerializer(utilisateur).data})
@@ -703,7 +782,7 @@ class MonProfilView(APIView):
 
     def patch(self, request):
         utilisateur = request.user.utilisateur
-        serializer = MonProfilSerializer(data=request.data)
+        serializer = MonProfilSerializer(data=request.data, context={"utilisateur": utilisateur})
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
@@ -715,12 +794,17 @@ class MonProfilView(APIView):
                 utilisateur.telephone = data["telephone"]
             utilisateur.save()
 
+        reponse = UtilisateurSerializer(utilisateur).data
         nouveau_mdp = data.get("nouveau_mot_de_passe")
         if nouveau_mdp:
             request.user.set_password(nouveau_mdp)
             request.user.save()
+            # Coupe les sessions ouvertes ailleurs (autre téléphone, poste
+            # oublié) et renvoie un nouveau jeton pour l'appareil courant.
+            Token.objects.filter(user=request.user).delete()
+            reponse = {**reponse, "token": Token.objects.create(user=request.user).key}
 
-        return Response(UtilisateurSerializer(utilisateur).data)
+        return Response(reponse)
 
 
 class AjustementStockView(APIView):
@@ -745,20 +829,21 @@ class AjustementStockView(APIView):
 
 class AnnulerVenteView(APIView):
     """
-    POST /api/ventes/<id>/annuler/ — annule une vente : restitue le
-    stock de chaque ligne, marque la transaction "annulee". Ne
-    supprime jamais la transaction elle-même (traçabilité : on doit
-    toujours pouvoir voir qu'une vente a existé puis a été annulée,
-    pas la faire disparaître comme si de rien n'était).
+    POST /api/ventes/<id>/annuler/ — annule une vente ou une prestation et
+    défait TOUS ses effets encore en place :
+    - stock : on ne remet que la quantité pas déjà rendue par un retour ;
+    - crédit client : on retire la part à crédit pas déjà déduite par un retour ;
+    - points fidélité gagnés sur cette vente (jamais sous zéro) ;
+    - caisse : les espèces encore dues au client sortent de la session de
+      la personne qui annule (ou de la session d'origine si elle est encore
+      ouverte), et sont soustraites de son rapport Z.
+    Ne supprime jamais la transaction (traçabilité).
     """
     permission_classes = [EstAdmin]
 
     def post(self, request, pk):
         # select_for_update() exige une transaction déjà ouverte — tout
-        # le corps de la vue doit donc être dans le bloc atomic (bug
-        # préexistant corrigé ici : ATOMIC_REQUESTS n'est pas activé dans
-        # ce projet, donc select_for_update() hors atomic() lève
-        # TransactionManagementError dès qu'on l'exerce réellement).
+        # le corps de la vue doit donc être dans le bloc atomic.
         with transaction.atomic():
             try:
                 transaction_caisse = TransactionCaisse.objects.select_for_update().get(pk=pk)
@@ -768,18 +853,76 @@ class AnnulerVenteView(APIView):
             if transaction_caisse.annulee:
                 return Response({"detail": "Cette vente est déjà annulée."}, status=status.HTTP_400_BAD_REQUEST)
 
+            retours = list(transaction_caisse.retours.all())
+            montant_retourne = sum((r.montant_total for r in retours), Decimal("0"))
+
+            # Espèces encore à rendre = part espèces - ce que les retours ont déjà rendu en liquide.
+            especes_a_rendre = part_especes(transaction_caisse) - sum(
+                (r.montant_total for r in retours if r.affecte_caisse), Decimal("0")
+            )
+            especes_a_rendre = max(especes_a_rendre, Decimal("0"))
+
+            session_annulation = SessionCaisse.objects.filter(
+                utilisateur=request.user.utilisateur, statut=StatutSession.OUVERTE
+            ).first()
+            session_origine = transaction_caisse.session_caisse
+            if session_annulation is None and session_origine and session_origine.statut == StatutSession.OUVERTE:
+                session_annulation = session_origine
+            if session_annulation is None and especes_a_rendre > 0:
+                return Response(
+                    {"detail": "Ouvre ta session de caisse pour rendre les espèces de cette vente "
+                               f"({especes_a_rendre} F) avant de l'annuler."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             vente = getattr(transaction_caisse, "venteproduits", None)
             if vente is not None:
-                # Restitution du stock ligne par ligne, avec le même
-                # verrouillage que la création de vente — cohérent des
-                # deux côtés de la même opération.
-                for ligne in vente.lignes.select_related("produit"):
-                    produit = Produit.objects.select_for_update().get(pk=ligne.produit_id)
-                    produit.quantite_stock = F("quantite_stock") + ligne.quantite
-                    produit.save(update_fields=["quantite_stock"])
+                for ligne in vente.lignes.all():
+                    deja_rendue = ligne.retours.aggregate(total=Sum("quantite"))["total"] or Decimal("0")
+                    a_remettre = ligne.quantite - deja_rendue
+                    if a_remettre > 0:
+                        produit = Produit.objects.select_for_update().get(pk=ligne.produit_id)
+                        produit.quantite_stock = F("quantite_stock") + a_remettre
+                        produit.save(update_fields=["quantite_stock"])
+
+            if transaction_caisse.client_id:
+                client = Client.objects.select_for_update().get(pk=transaction_caisse.client_id)
+                credit_restant = Decimal("0")
+                if transaction_caisse.mode_paiement == ModePaiement.CREDIT:
+                    # Chaque retour a déjà déduit son montant complet de la dette.
+                    credit_restant = transaction_caisse.montant_total - montant_retourne
+                elif transaction_caisse.mode_paiement == ModePaiement.MIXTE:
+                    ligne_credit = transaction_caisse.paiements.filter(mode_paiement=ModePaiement.CREDIT).first()
+                    if ligne_credit:
+                        # Même formule (et même arrondi) que RetourVenteCreationSerializer.
+                        deja_deduit = sum(
+                            ((ligne_credit.montant * r.montant_total / transaction_caisse.montant_total)
+                             .quantize(Decimal("0.01")) for r in retours),
+                            Decimal("0"),
+                        )
+                        credit_restant = ligne_credit.montant - deja_deduit
+                if credit_restant > 0:
+                    client.solde_credit = F("solde_credit") - credit_restant
+                if vente is not None:
+                    # Même règle que VenteCreationSerializer : 1 point par 500 F.
+                    points = int(transaction_caisse.montant_total // 500)
+                    if points > 0:
+                        # Case plutôt que Greatest(F - points, 0) : sur MySQL la
+                        # colonne est UNSIGNED, une soustraction négative y
+                        # lèverait une erreur avant même le plancher à 0.
+                        client.points_fidelite = Case(
+                            When(points_fidelite__gte=points, then=F("points_fidelite") - points),
+                            default=Value(0),
+                        )
+                client.save(update_fields=["solde_credit", "points_fidelite"])
 
             transaction_caisse.annulee = True
-            transaction_caisse.save(update_fields=["annulee"])
+            transaction_caisse.date_annulation = timezone.now()
+            transaction_caisse.session_annulation = session_annulation
+            transaction_caisse.montant_annulation_especes = especes_a_rendre if session_annulation else Decimal("0")
+            transaction_caisse.save(update_fields=[
+                "annulee", "date_annulation", "session_annulation", "montant_annulation_especes",
+            ])
             transaction_caisse.refresh_from_db()
 
         return Response(TransactionCaisseLectureSerializer(transaction_caisse).data)
@@ -795,16 +938,19 @@ class RetourVenteView(APIView):
     permission_classes = [EstAdmin]
 
     def post(self, request, pk):
-        try:
-            vente = TransactionCaisse.objects.select_related("client").get(pk=pk)
-        except TransactionCaisse.DoesNotExist:
-            return Response({"detail": "Vente introuvable."}, status=status.HTTP_404_NOT_FOUND)
+        # Verrou sur la vente pendant tout le retour : une annulation ou un
+        # autre retour concurrent attend la fin de celui-ci.
+        with transaction.atomic():
+            try:
+                vente = TransactionCaisse.objects.select_for_update().get(pk=pk)
+            except TransactionCaisse.DoesNotExist:
+                return Response({"detail": "Vente introuvable."}, status=status.HTTP_404_NOT_FOUND)
 
-        serializer = RetourVenteCreationSerializer(
-            data=request.data, context={"vente": vente, "utilisateur": request.user.utilisateur}
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+            serializer = RetourVenteCreationSerializer(
+                data=request.data, context={"vente": vente, "utilisateur": request.user.utilisateur}
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
         vente.refresh_from_db()
         return Response(TransactionCaisseLectureSerializer(vente).data, status=status.HTTP_201_CREATED)
 
@@ -939,11 +1085,13 @@ class ArchiverCreanceFournisseurView(APIView):
         derniere_archive = fournisseur.archives_creance.first()
         depuis = derniere_archive.date_archivage if derniere_archive else None
 
-        receptions_qs = Approvisionnement.objects.filter(fournisseur=fournisseur)
+        # Seule la part NON payée à la réception (tranche/crédit) a créé de la
+        # dette — une réception payée comptant ou annulée n'en fait pas partie.
+        receptions_qs = Approvisionnement.objects.filter(fournisseur=fournisseur, annulee=False)
         if depuis:
             receptions_qs = receptions_qs.filter(date_reception__gt=depuis)
         total_recu = receptions_qs.aggregate(
-            total=Coalesce(Sum("montant_total"), 0, output_field=DecimalField())
+            total=Coalesce(Sum(F("montant_total") - F("montant_paye")), 0, output_field=DecimalField())
         )["total"]
 
         paiements_qs = PaiementFournisseur.objects.filter(fournisseur=fournisseur)
@@ -1051,6 +1199,17 @@ from rest_framework.throttling import ScopedRateThrottle
 from django.conf import settings
 
 
+class DeconnexionView(APIView):
+    """POST /api/deconnexion/ — révoque le jeton de l'appareil : un jeton
+    copié ou volé ne sert plus à rien après la déconnexion."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if request.auth is not None:
+            request.auth.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class ConnexionView(ObtainAuthToken):
     """
     Endpoint de connexion : POST /api/connexion/ avec {username, password}
@@ -1073,6 +1232,8 @@ class ConnexionView(ObtainAuthToken):
             token = Token.objects.create(user=user)
 
         utilisateur = getattr(user, "utilisateur", None)
+        if utilisateur is not None and not utilisateur.actif:
+            return Response({"detail": "Ce compte a été désactivé."}, status=status.HTTP_403_FORBIDDEN)
         return Response({
             "token": token.key,
             "nom": utilisateur.nom if utilisateur else user.username,
