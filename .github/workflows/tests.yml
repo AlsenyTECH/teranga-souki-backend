@@ -1,0 +1,50 @@
+# Lance la suite de tests Django à chaque push et pull request, sur un vrai
+# MySQL 8.4 (même moteur qu'en production sur Railway).
+name: Tests backend
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: teranga
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      SECRET_KEY: cle-de-test-ci
+      DEBUG: "True"
+      DATABASE_URL: mysql://root:root@127.0.0.1:3306/teranga
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Dépendances système (mysqlclient)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends default-libmysqlclient-dev pkg-config
+
+      - name: Dépendances Python
+        run: pip install -r requirements.txt
+
+      - name: Vérifications Django
+        run: |
+          python manage.py check
+          python manage.py makemigrations --check --dry-run
+
+      - name: Tests
+        run: python manage.py test superette -v 2
