@@ -109,6 +109,15 @@ class Produit(models.Model):
         # Méthode "métier" simple, directement utilisable dans les vues/rapports
         return self.quantite_stock <= self.seuil_alerte
 
+    def prix_pour(self, quantite):
+        """Prix catalogue applicable pour cette quantité : prix de gros dès
+        que le seuil est atteint, prix de détail sinon. Miroir exact de
+        Produit.prixPour() côté Flutter — c'est la valeur que le serveur
+        impose quand le vendeur n'a pas le droit de modifier les prix."""
+        if self.prix_vente_gros is not None and self.seuil_gros is not None and quantite >= self.seuil_gros:
+            return self.prix_vente_gros
+        return self.prix_vente
+
 
 class Client(models.Model):
     nom = models.CharField(max_length=100)
@@ -212,6 +221,16 @@ class TransactionCaisse(models.Model):
     session_caisse = models.ForeignKey(
         SessionCaisse, on_delete=models.PROTECT, null=True, blank=True, related_name="transactions"
     )
+    # Annulation : session de caisse d'où sortent les espèces rendues, et
+    # montant rendu (figé). Le rapport Z compte la vente d'origine dans SA
+    # session, puis soustrait ce montant dans la session d'annulation — même
+    # principe que RetourVente.session_caisse. Nuls pour une transaction non
+    # annulée, ou annulée avant l'introduction de ces champs.
+    session_annulation = models.ForeignKey(
+        SessionCaisse, on_delete=models.PROTECT, null=True, blank=True, related_name="annulations"
+    )
+    montant_annulation_especes = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    date_annulation = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         indexes = [models.Index(fields=["date_heure"])]  # traduit notre INDEX idx_transaction_date
@@ -468,6 +487,17 @@ class RemboursementCredit(models.Model):
     montant = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0.01)])
     utilisateur = models.ForeignKey(Utilisateur, on_delete=models.PROTECT)
     date_heure = models.DateTimeField(auto_now_add=True)
+    # Moyen utilisé par le client pour rembourser. En espèces, l'argent entre
+    # dans le tiroir : le remboursement est alors rattaché à la session de
+    # caisse ouverte et compté dans son rapport Z.
+    mode_paiement = models.CharField(
+        max_length=20,
+        choices=[("especes", "Espèces"), ("wave", "Wave"), ("orange_money", "Orange Money")],
+        default="especes",
+    )
+    session_caisse = models.ForeignKey(
+        SessionCaisse, on_delete=models.PROTECT, null=True, blank=True, related_name="remboursements_credit"
+    )
 
     def __str__(self):
         return f"{self.client} rembourse {self.montant} F"

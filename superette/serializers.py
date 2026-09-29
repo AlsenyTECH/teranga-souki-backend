@@ -133,6 +133,7 @@ class ServiceSerializer(serializers.ModelSerializer):
 from django.db import transaction
 from django.db.models import F, Sum
 from .models import TransactionCaisse, VenteProduits, LigneVente, SessionCaisse, StatutSession, PaiementVente
+from .permissions import peut_accorder_remises
 
 
 class LigneVenteEcritureSerializer(serializers.Serializer):
@@ -164,7 +165,9 @@ class LigneVenteLectureSerializer(serializers.ModelSerializer):
         ]
 
     def get_quantite_retournee(self, obj):
-        return obj.retours.aggregate(total=Sum("quantite"))["total"] or Decimal("0")
+        # .all() + somme Python : profite du prefetch_related de la vue
+        # (une requête par liste au lieu d'une par ligne de vente).
+        return sum((r.quantite for r in obj.retours.all()), Decimal("0"))
 
     def get_quantite_restante(self, obj):
         return obj.quantite - self.get_quantite_retournee(obj)
@@ -174,6 +177,13 @@ class PaiementVenteEcritureSerializer(serializers.Serializer):
     # Jamais "mixte" au niveau d'une ligne — seulement les modes simples.
     mode_paiement = serializers.ChoiceField(choices=["especes", "wave", "orange_money", "credit"])
     montant = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0.01"))
+
+
+def _prix_ligne(ligne, produit):
+    """Prix envoyé s'il y en a un (déjà contrôlé par validate()), sinon le
+    prix catalogue — y compris le prix de gros au-delà du seuil."""
+    prix = ligne.get("prix_unitaire_vente")
+    return prix if prix is not None else produit.prix_pour(ligne["quantite"])
 
 
 class VenteCreationSerializer(serializers.Serializer):
@@ -248,8 +258,28 @@ class VenteCreationSerializer(serializers.Serializer):
             )
 
         reduction = data.get("reduction_montant") or Decimal("0")
+
+        # Le prix est une donnée du catalogue, pas du client HTTP : sans la
+        # permission "remises", le prix envoyé doit être exactement le prix
+        # catalogue (détail/gros) et aucune réduction n'est acceptée.
+        # Autrement, un caissier pourrait vendre à 1 F sans laisser de trace.
+        autorise = peut_accorder_remises(self.context.get("utilisateur"))
+        if not autorise:
+            if reduction > 0:
+                raise serializers.ValidationError(
+                    "Tu n'as pas l'autorisation d'accorder une réduction — demande à un admin."
+                )
+            for ligne in data.get("lignes", []):
+                prix_saisi = ligne.get("prix_unitaire_vente")
+                prix_catalogue = ligne["produit"].prix_pour(ligne["quantite"])
+                if prix_saisi is not None and prix_saisi != prix_catalogue:
+                    raise serializers.ValidationError(
+                        f"Tu n'as pas l'autorisation de modifier le prix de {ligne['produit'].nom} "
+                        f"(prix catalogue : {prix_catalogue} F)."
+                    )
+
         sous_total = sum(
-            (ligne.get("prix_unitaire_vente") or ligne["produit"].prix_vente) * ligne["quantite"]
+            _prix_ligne(ligne, ligne["produit"]) * ligne["quantite"]
             for ligne in data.get("lignes", [])
         )
         if reduction > 0 and reduction > sous_total:
@@ -305,7 +335,7 @@ class VenteCreationSerializer(serializers.Serializer):
                         f"(disponible: {produit.quantite_stock}, demandé: {ligne['quantite']})"
                     )
 
-                prix = ligne.get("prix_unitaire_vente", produit.prix_vente)
+                prix = _prix_ligne(ligne, produit)
                 montant_total += prix * ligne["quantite"]
                 lignes_pretes.append((produit, ligne["quantite"], prix))
 
@@ -314,7 +344,7 @@ class VenteCreationSerializer(serializers.Serializer):
             # encaissé, puisque les points fidélité et l'incrément du
             # solde crédit (plus bas) se basent dessus.
             reduction = validated_data.get("reduction_montant") or Decimal("0")
-            montant_total -= reduction
+            montant_total = (montant_total - reduction).quantize(Decimal("0.01"))
 
             transaction_caisse = TransactionCaisse.objects.create(
                 montant_total=montant_total,
@@ -408,6 +438,7 @@ class TransactionCaisseLectureSerializer(serializers.ModelSerializer):
             "id", "date_heure", "montant_total", "mode_paiement",
             "caissier_nom", "client_nom", "client_telephone", "client_adresse", "annulee", "lignes",
             "reduction_montant", "sous_total", "montant_retourne", "montant_net", "paiements",
+            "date_annulation", "montant_annulation_especes",
         ]
 
     def get_client_telephone(self, obj):
@@ -422,8 +453,8 @@ class TransactionCaisseLectureSerializer(serializers.ModelSerializer):
         return montant.quantize(Decimal("0.01"))
 
     def get_montant_retourne(self, obj):
-        total = obj.retours.aggregate(total=Sum("montant_total"))["total"] or Decimal("0")
-        return total.quantize(Decimal("0.01"))
+        total = sum((r.montant_total for r in obj.retours.all()), Decimal("0"))
+        return Decimal(total).quantize(Decimal("0.01"))
 
     def get_montant_net(self, obj):
         return (obj.montant_total - self.get_montant_retourne(obj)).quantize(Decimal("0.01"))
@@ -482,6 +513,9 @@ class RetourVenteCreationSerializer(serializers.Serializer):
         for ligne in data["lignes"]:
             if ligne["ligne_vente"].vente_id != venteproduits.pk:
                 raise serializers.ValidationError("Une des lignes indiquées n'appartient pas à cette vente.")
+        ids = [ligne["ligne_vente"].pk for ligne in data["lignes"]]
+        if len(ids) != len(set(ids)):
+            raise serializers.ValidationError("Une même ligne de vente apparaît deux fois dans ce retour.")
 
         if data.get("rembourser_en_especes"):
             if vente.mode_paiement != "mixte":
@@ -528,7 +562,33 @@ class RetourVenteCreationSerializer(serializers.Serializer):
                     )
                 montant_ligne = ligne_vente.prix_unitaire_vente * ligne["quantite"]
                 montant_total += montant_ligne
-                lignes_pretes.append((ligne_vente, ligne["quantite"]))
+                lignes_pretes.append((ligne_vente, ligne["quantite"], restante))
+
+            # La réduction accordée sur la vente s'applique aussi au retour,
+            # au prorata : on ne rend jamais plus que ce qui a été payé.
+            # Ex. vente 2000 F remisée à 1000 F -> rendre tout = 1000 F.
+            reduction = vente.venteproduits.reduction_montant
+            sous_total = vente.montant_total + reduction
+            if reduction > 0 and sous_total > 0:
+                montant_total = montant_total * vente.montant_total / sous_total
+            montant_total = montant_total.quantize(Decimal("0.01"))
+
+            deja_rembourse = vente.retours.aggregate(total=Sum("montant_total"))["total"] or Decimal("0")
+            reste_a_rembourser = vente.montant_total - deja_rembourse
+            rendu_maintenant = {lv.pk: quantite for lv, quantite, _ in lignes_pretes}
+            tout_est_rendu = all(
+                l.quantite
+                - (l.retours.aggregate(total=Sum("quantite"))["total"] or Decimal("0"))
+                - rendu_maintenant.get(l.pk, Decimal("0"))
+                <= 0
+                for l in vente.venteproduits.lignes.all()
+            )
+            # Dernier retour qui solde la vente : on rend exactement le reste
+            # (absorbe les écarts d'arrondi des retours précédents).
+            if tout_est_rendu or montant_total > reste_a_rembourser:
+                montant_total = reste_a_rembourser
+            if montant_total <= 0:
+                raise serializers.ValidationError("Cette vente a déjà été entièrement remboursée.")
 
             if vente.mode_paiement == "especes":
                 affecte_caisse = True
@@ -545,7 +605,7 @@ class RetourVenteCreationSerializer(serializers.Serializer):
                 affecte_caisse=affecte_caisse,
                 commentaire=validated_data.get("commentaire", ""),
             )
-            for ligne_vente, quantite in lignes_pretes:
+            for ligne_vente, quantite, _ in lignes_pretes:
                 LigneRetour.objects.create(retour=retour, ligne_vente=ligne_vente, quantite=quantite)
                 produit = Produit.objects.select_for_update().get(pk=ligne_vente.produit_id)
                 produit.quantite_stock = F("quantite_stock") + quantite
@@ -739,7 +799,20 @@ def verifier_appro_modifiable(appro):
         ajustement_posterieur = AjustementStock.objects.filter(
             produit=produit, date_heure__gt=appro.date_reception
         ).exists()
-        if plus_recente_appro or vente_posterieure or ajustement_posterieur:
+        # Retours client/fournisseur et annulations de vente postérieurs :
+        # ils ont aussi fait bouger le stock de ce produit depuis.
+        retour_posterieur = (
+            LigneRetour.objects.filter(
+                ligne_vente__produit=produit, retour__date_heure__gt=appro.date_reception
+            ).exists()
+            or LigneRetourAppro.objects.filter(
+                ligne_appro__produit=produit, retour__date_heure__gt=appro.date_reception
+            ).exists()
+            or TransactionCaisse.objects.filter(
+                venteproduits__lignes__produit=produit, date_annulation__gt=appro.date_reception
+            ).exists()
+        )
+        if plus_recente_appro or vente_posterieure or ajustement_posterieur or retour_posterieur:
             raise serializers.ValidationError(
                 f"« {produit.nom} » a bougé depuis cette réception (vente, ajustement ou "
                 "autre réception plus récente) — impossible de la modifier ou de la supprimer."
@@ -937,6 +1010,9 @@ class RetourApproCreationSerializer(serializers.Serializer):
         for ligne in data["lignes"]:
             if ligne["ligne_appro"].appro_id != appro.pk:
                 raise serializers.ValidationError("Une des lignes indiquées n'appartient pas à cette réception.")
+        ids = [ligne["ligne_appro"].pk for ligne in data["lignes"]]
+        if len(ids) != len(set(ids)):
+            raise serializers.ValidationError("Une même ligne de réception apparaît deux fois dans ce retour.")
         return data
 
     def create(self, validated_data):
@@ -969,6 +1045,13 @@ class RetourApproCreationSerializer(serializers.Serializer):
             for ligne_appro, quantite in lignes_pretes:
                 LigneRetourAppro.objects.create(retour=retour, ligne_appro=ligne_appro, quantite=quantite)
                 produit = Produit.objects.select_for_update().get(pk=ligne_appro.produit_id)
+                # Une partie a pu être vendue depuis la réception : on ne
+                # renvoie jamais plus que ce qui est réellement en rayon.
+                if produit.quantite_stock < quantite:
+                    raise serializers.ValidationError(
+                        f"Stock insuffisant pour renvoyer {quantite} de {produit.nom} "
+                        f"(en stock : {produit.quantite_stock})."
+                    )
                 # Le stock diminue (la marchandise repart chez le
                 # fournisseur) — le CUMP n'est volontairement pas
                 # recalculé, même simplification que pour un retour
@@ -1103,11 +1186,24 @@ class PrestationLectureSerializer(serializers.ModelSerializer):
 from django.contrib.auth.models import User
 from .permissions import CLES_PERMISSIONS_VALIDES
 from django.contrib.auth.hashers import make_password
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
+
+
+def valider_mot_de_passe(mot_de_passe, user=None, champ=None):
+    """Applique AUTH_PASSWORD_VALIDATORS (longueur, mots de passe courants,
+    tout-numérique, ressemblance avec l'identifiant) — make_password() et
+    set_password() ne le font jamais d'eux-mêmes."""
+    try:
+        validate_password(mot_de_passe, user)
+    except DjangoValidationError as e:
+        messages = list(e.messages)
+        raise serializers.ValidationError({champ: messages} if champ else messages)
 
 
 class UtilisateurCreationSerializer(serializers.Serializer):
     username = serializers.CharField(max_length=150)
-    password = serializers.CharField(write_only=True, min_length=6)
+    password = serializers.CharField(write_only=True, min_length=8)
     nom = serializers.CharField(max_length=100)
     telephone = serializers.CharField(max_length=20)
     role = serializers.PrimaryKeyRelatedField(queryset=Role.objects.all())
@@ -1128,6 +1224,15 @@ class UtilisateurCreationSerializer(serializers.Serializer):
         if invalides:
             raise serializers.ValidationError(f"Permission(s) inconnue(s) : {', '.join(invalides)}")
         return value
+
+    def validate_telephone(self, value):
+        if Utilisateur.objects.filter(telephone=value).exists():
+            raise serializers.ValidationError("Ce téléphone est déjà utilisé par un autre compte.")
+        return value
+
+    def validate(self, data):
+        valider_mot_de_passe(data["password"], User(username=data["username"]), champ="password")
+        return data
 
     def create(self, validated_data):
         with transaction.atomic():
@@ -1166,7 +1271,21 @@ class MonProfilSerializer(serializers.Serializer):
     """
     nom = serializers.CharField(max_length=100, required=False)
     telephone = serializers.CharField(max_length=20, required=False)
-    nouveau_mot_de_passe = serializers.CharField(write_only=True, required=False, min_length=6)
+    nouveau_mot_de_passe = serializers.CharField(write_only=True, required=False, min_length=8)
+
+    def validate_telephone(self, value):
+        utilisateur = self.context.get("utilisateur")
+        qs = Utilisateur.objects.filter(telephone=value)
+        if utilisateur is not None:
+            qs = qs.exclude(pk=utilisateur.pk)
+        if qs.exists():
+            raise serializers.ValidationError("Ce téléphone est déjà utilisé par un autre compte.")
+        return value
+
+    def validate_nouveau_mot_de_passe(self, value):
+        utilisateur = self.context.get("utilisateur")
+        valider_mot_de_passe(value, utilisateur.compte if utilisateur else None)
+        return value
 
 
 class UtilisateurEditionSerializer(serializers.Serializer):
@@ -1179,7 +1298,7 @@ class UtilisateurEditionSerializer(serializers.Serializer):
     nom = serializers.CharField(max_length=100, required=False)
     telephone = serializers.CharField(max_length=20, required=False)
     username = serializers.CharField(max_length=150, required=False)
-    nouveau_mot_de_passe = serializers.CharField(write_only=True, required=False, min_length=6)
+    nouveau_mot_de_passe = serializers.CharField(write_only=True, required=False, min_length=8)
 
     def validate_username(self, value):
         # exclude=self.instance : permet de renvoyer le même identifiant
@@ -1197,6 +1316,10 @@ class UtilisateurEditionSerializer(serializers.Serializer):
             qs = qs.exclude(pk=self.instance.pk)
         if qs.exists():
             raise serializers.ValidationError("Ce téléphone est déjà utilisé par un autre compte.")
+        return value
+
+    def validate_nouveau_mot_de_passe(self, value):
+        valider_mot_de_passe(value, self.instance.compte if self.instance else None)
         return value
 
 
@@ -1262,11 +1385,15 @@ class RemboursementCreditSerializer(serializers.Serializer):
     POST /api/remboursements-credit/
     {
       "client": 3,
-      "montant": "5000.00"
+      "montant": "5000.00",
+      "mode_paiement": "especes"     // optionnel, défaut espèces
     }
+    En espèces, l'argent entre dans le tiroir : il faut une session de
+    caisse ouverte, et le montant est compté dans son rapport Z.
     """
     client = serializers.PrimaryKeyRelatedField(queryset=Client.objects.all())
     montant = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0.01"))
+    mode_paiement = serializers.ChoiceField(choices=["especes", "wave", "orange_money"], default="especes")
 
     def validate(self, data):
         if data["montant"] > data["client"].solde_credit:
@@ -1277,10 +1404,27 @@ class RemboursementCreditSerializer(serializers.Serializer):
 
     def create(self, validated_data):
         utilisateur = self.context["utilisateur"]
-        client = validated_data["client"]
         with transaction.atomic():
+            # Relecture verrouillée : deux remboursements envoyés en même
+            # temps (double clic) ne peuvent pas passer tous les deux sous la
+            # dette réelle — validate() a lu une valeur non verrouillée.
+            client = Client.objects.select_for_update().get(pk=validated_data["client"].pk)
+            if validated_data["montant"] > client.solde_credit:
+                raise serializers.ValidationError(
+                    f"Le montant dépasse la dette du client ({client.solde_credit} F)."
+                )
+            session = None
+            if validated_data["mode_paiement"] == "especes":
+                session = SessionCaisse.objects.filter(
+                    utilisateur=utilisateur, statut=StatutSession.OUVERTE
+                ).first()
+                if session is None:
+                    raise serializers.ValidationError(
+                        "Aucune session de caisse ouverte — ouvre la caisse pour encaisser un remboursement en espèces."
+                    )
             RemboursementCredit.objects.create(
-                client=client, montant=validated_data["montant"], utilisateur=utilisateur
+                client=client, montant=validated_data["montant"], utilisateur=utilisateur,
+                mode_paiement=validated_data["mode_paiement"], session_caisse=session,
             )
             client.solde_credit = F("solde_credit") - validated_data["montant"]
             client.save(update_fields=["solde_credit"])
@@ -1293,7 +1437,7 @@ class RemboursementCreditLectureSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = RemboursementCredit
-        fields = ["id", "client", "montant", "utilisateur_nom", "date_heure"]
+        fields = ["id", "client", "montant", "mode_paiement", "utilisateur_nom", "date_heure"]
 
 
 # ============================================================
@@ -1324,8 +1468,12 @@ class PaiementFournisseurSerializer(serializers.Serializer):
 
     def create(self, validated_data):
         utilisateur = self.context["utilisateur"]
-        fournisseur = validated_data["fournisseur"]
         with transaction.atomic():
+            fournisseur = Fournisseur.objects.select_for_update().get(pk=validated_data["fournisseur"].pk)
+            if validated_data["montant"] > fournisseur.solde_du:
+                raise serializers.ValidationError(
+                    f"Le montant dépasse la dette envers ce fournisseur ({fournisseur.solde_du} F)."
+                )
             PaiementFournisseur.objects.create(
                 fournisseur=fournisseur, montant=validated_data["montant"], utilisateur=utilisateur
             )
@@ -1349,6 +1497,21 @@ class PaiementFournisseurLectureSerializer(serializers.ModelSerializer):
 # ============================================================
 
 from django.utils import timezone
+from django.db import models
+
+
+def part_especes(transaction_caisse):
+    """Espèces réellement entrées dans le tiroir pour cette transaction :
+    tout le montant en mode espèces, la ligne espèces d'un paiement mixte,
+    rien pour Wave/Orange Money/crédit."""
+    if transaction_caisse.mode_paiement == "especes":
+        return transaction_caisse.montant_total
+    if transaction_caisse.mode_paiement == "mixte":
+        return sum(
+            (p.montant for p in transaction_caisse.paiements.all() if p.mode_paiement == "especes"),
+            Decimal("0"),
+        )
+    return Decimal("0")
 
 
 def calculer_totaux_session(session):
@@ -1356,30 +1519,47 @@ def calculer_totaux_session(session):
     Calcule les totaux d'une session de caisse — utilisé aussi bien pour
     l'affichage en direct (session encore ouverte, GET .../courante/) que
     pour figer le rapport Z à la fermeture. Ne modifie jamais la session.
+
+    Chaque mouvement d'espèces compte dans la session où il a PHYSIQUEMENT
+    eu lieu : une vente dans sa session, un retour/une annulation dans la
+    session de la personne qui rend l'argent, un remboursement de crédit en
+    espèces dans la session qui l'encaisse. Une vente annulée compte donc
+    +X dans sa session et -X dans la session d'annulation (net 0 si c'est
+    la même), jamais "disparue" d'une session déjà fermée.
     """
-    transactions = TransactionCaisse.objects.filter(session_caisse=session, annulee=False)
+    # Ventes comptées : non annulées, ou annulées avec traçage de la session
+    # d'annulation. Les annulations antérieures à ce traçage (session_annulation
+    # nulle) restent exclues, comme avant, pour ne pas fausser l'historique.
+    transactions = TransactionCaisse.objects.filter(session_caisse=session).filter(
+        models.Q(annulee=False) | models.Q(session_annulation__isnull=False)
+    )
     ventes_especes = transactions.filter(mode_paiement="especes").aggregate(
         total=Sum("montant_total")
     )["total"] or Decimal("0")
-    # Part espèces des ventes en paiement mixte de cette session — une
-    # vente mixte n'a pas mode_paiement="especes" (c'est "mixte"), donc
-    # invisible à l'agrégat ci-dessus ; sa ligne PaiementVente en espèces
-    # doit quand même compter dans la caisse physique.
-    ventes_especes_mixte = PaiementVente.objects.filter(
-        mode_paiement="especes", vente__session_caisse=session, vente__annulee=False
+    # Part espèces des ventes en paiement mixte de cette session.
+    ventes_especes += PaiementVente.objects.filter(
+        mode_paiement="especes", vente__in=transactions.filter(mode_paiement="mixte")
     ).aggregate(total=Sum("montant"))["total"] or Decimal("0")
-    ventes_especes += ventes_especes_mixte
-    # Les retours en espèces sortent physiquement de LA CAISSE DU JOUR,
-    # donc toujours rattachés à la session actuellement ouverte (voir
-    # RetourVenteCreationSerializer) — jamais à la session de la vente
-    # d'origine, qui peut être une session différente, déjà fermée.
+
     retours_especes = RetourVente.objects.filter(session_caisse=session, affecte_caisse=True).aggregate(
         total=Sum("montant_total")
     )["total"] or Decimal("0")
-    montant_attendu = session.fond_ouverture + ventes_especes - retours_especes
+    annulations_especes = TransactionCaisse.objects.filter(session_annulation=session).aggregate(
+        total=Sum("montant_annulation_especes")
+    )["total"] or Decimal("0")
+    remboursements_credit_especes = RemboursementCredit.objects.filter(
+        session_caisse=session, mode_paiement="especes"
+    ).aggregate(total=Sum("montant"))["total"] or Decimal("0")
+
+    montant_attendu = (
+        session.fond_ouverture + ventes_especes + remboursements_credit_especes
+        - retours_especes - annulations_especes
+    )
     return {
         "ventes_especes": ventes_especes,
         "retours_especes": retours_especes,
+        "annulations_especes": annulations_especes,
+        "remboursements_credit_especes": remboursements_credit_especes,
         "montant_attendu": montant_attendu,
     }
 
@@ -1395,12 +1575,16 @@ class SessionCaisseOuvertureSerializer(serializers.Serializer):
 
     def create(self, validated_data):
         utilisateur = self.context["utilisateur"]
-        if SessionCaisse.objects.filter(utilisateur=utilisateur, statut=StatutSession.OUVERTE).exists():
-            raise serializers.ValidationError("Tu as déjà une session de caisse ouverte.")
-        return SessionCaisse.objects.create(
-            utilisateur=utilisateur,
-            fond_ouverture=validated_data.get("fond_ouverture") or Decimal("0"),
-        )
+        with transaction.atomic():
+            # Verrou sur le profil : deux clics simultanés sur "Ouvrir la
+            # caisse" sont sérialisés, le second voit la session du premier.
+            Utilisateur.objects.select_for_update().get(pk=utilisateur.pk)
+            if SessionCaisse.objects.filter(utilisateur=utilisateur, statut=StatutSession.OUVERTE).exists():
+                raise serializers.ValidationError("Tu as déjà une session de caisse ouverte.")
+            return SessionCaisse.objects.create(
+                utilisateur=utilisateur,
+                fond_ouverture=validated_data.get("fond_ouverture") or Decimal("0"),
+            )
 
 
 class SessionCaisseFermetureSerializer(serializers.Serializer):

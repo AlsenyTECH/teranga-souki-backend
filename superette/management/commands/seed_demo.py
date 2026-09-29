@@ -15,7 +15,8 @@
 from decimal import Decimal
 import random
 
-from django.core.management.base import BaseCommand
+from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
 from django.contrib.auth.models import User
 from django.contrib.auth.hashers import make_password
 from django.utils import timezone
@@ -30,7 +31,21 @@ from superette.models import (
 class Command(BaseCommand):
     help = "Remplit la base avec des données de démonstration pour Teranga Souki."
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--force", action="store_true",
+            help="Autorise l'exécution même avec DEBUG=False (à éviter en production).",
+        )
+
     def handle(self, *args, **options):
+        # Garde-fou : cette commande crée des comptes aux mots de passe
+        # connus (admin1/admin1234). Lancée par erreur sur Railway, elle
+        # ouvrirait un accès admin à n'importe qui.
+        if not settings.DEBUG and not options["force"]:
+            raise CommandError(
+                "seed_demo est réservé au développement (DEBUG=True). "
+                "Ajoute --force si tu sais vraiment ce que tu fais."
+            )
         self.stdout.write("Rôles...")
         role_admin, _ = Role.objects.get_or_create(libelle="admin")
         role_caissier, _ = Role.objects.get_or_create(libelle="caissier")
