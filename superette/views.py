@@ -369,6 +369,7 @@ def calculer_totaux_periode(debut, fin):
     - Marge = Σ (prix - CUMP actuel) x quantité, moins les réductions
       accordées, moins la marge rendue par les retours. Approximation
       assumée : CUMP actuel, pas celui du jour de la vente (non historisé).
+    - Résultat net = marge + prestations - dépenses.
     """
     transactions = TransactionCaisse.objects.filter(
         date_heure__date__gte=debut, date_heure__date__lte=fin, annulee=False
@@ -424,7 +425,11 @@ def calculer_totaux_periode(debut, fin):
         "reductions_accordees": Decimal(total_reductions).quantize(deux),
         "marge_brute_ventes": Decimal(marge).quantize(deux),
         "total_depenses": Decimal(total_depenses).quantize(deux),
-        "resultat_net": Decimal(chiffre_affaires_total - total_depenses).quantize(deux),
+        # Bénéfice réel : ce qu'il reste une fois payées les marchandises
+        # vendues (marge) ET les charges (dépenses). Les prestations n'ont pas
+        # de coût d'achat, elles comptent en entier. Avant : CA - dépenses,
+        # qui oubliait le coût des marchandises et gonflait le résultat.
+        "resultat_net": Decimal(marge + ca_prestations - total_depenses).quantize(deux),
     }
 
 

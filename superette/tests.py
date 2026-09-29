@@ -432,6 +432,17 @@ class RapportTests(BaseTest):
         self.assertEqual(r["retours_ventes"], D("900.00"))
         self.assertEqual(r["marge_brute_ventes"], D("300.00"))
 
+    def test_resultat_net_retire_le_cout_des_marchandises(self):
+        # 2 riz à 1000 (CUMP 600) -> marge 800 ; prestation 250 ; dépense 300
+        self.vendre(self.api_admin, [{"produit": self.riz.id, "quantite": 2}])
+        service = Service.objects.create(libelle="Déplumage", tarif=D("250"))
+        self.api_admin.post("/api/prestations/", {"service": service.id, "mode_paiement": "especes"}, format="json")
+        self.api_admin.post("/api/depenses/", {"montant": "300", "categorie": "Transport",
+                                               "date_depense": self.jour}, format="json")
+        r = self.api_admin.get(f"/api/rapports/?date={self.jour}").data
+        self.assertEqual(r["chiffre_affaires_total"], D("2250.00"))
+        self.assertEqual(r["resultat_net"], D("750.00"))  # 800 + 250 - 300, pas 2250 - 300
+
     def test_periode_et_journalier_coherents_et_mixte_ventile(self):
         self.vendre(self.api_admin, [{"produit": self.riz.id, "quantite": 2}], mode_paiement="mixte",
                     paiements=[{"mode_paiement": "especes", "montant": "1200"},
@@ -577,3 +588,60 @@ class PrestationTests(BaseTest):
         self.assertEqual(D(caisse["montant_attendu"]), D("1000"))
         self.assertEqual(len(self.api_caissier.get("/api/prestations/").data), 1)
         self.assertTrue(Approvisionnement.objects.count() == 0)
+
+
+# ============================================================
+# Données de test : peupler_test / nettoyer_test
+# ============================================================
+
+class DonneesDeTestTests(TestCase):
+    def peupler(self, jours=3):
+        call_command("peupler_test", "--oui", "--jours", str(jours), "--mot-de-passe", "Test-Teranga-2026",
+                     stdout=StringIO())
+
+    def test_peupler_puis_nettoyer(self):
+        self.peupler()
+        self.assertEqual(User.objects.filter(username__startswith="test_").count(), 3)
+        self.assertTrue(Produit.objects.exists())
+        self.assertGreater(TransactionCaisse.objects.count(), 20)
+        # 3 caisses laissées ouvertes aujourd'hui, les autres fermées
+        self.assertEqual(SessionCaisse.objects.filter(statut="ouverte").count(), 3)
+        self.assertFalse(Produit.objects.filter(quantite_stock__lt=0).exists())
+        self.assertFalse(Client.objects.filter(solde_credit__lt=0).exists())
+        self.assertGreaterEqual(sum(p.stock_bas() for p in Produit.objects.all()), 3)
+        # l'historique est étalé sur plusieurs jours
+        jours = {t.date_heure.date() for t in TransactionCaisse.objects.all()}
+        self.assertEqual(len(jours), 4)
+        # un compte de test se connecte avec le mot de passe choisi
+        r = APIClient().post("/api/connexion/", {"username": "test_caissier1", "password": "Test-Teranga-2026"},
+                             format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+
+        call_command("nettoyer_test", "--oui", stdout=StringIO())
+        self.assertFalse(Produit.objects.exists())
+        self.assertFalse(TransactionCaisse.objects.exists())
+        self.assertFalse(User.objects.filter(username__startswith="test_").exists())
+
+    def test_peupler_refuse_une_base_non_vide(self):
+        Produit.objects.create(nom="Réel", prix_vente=D("100"), categorie=Categorie.objects.create(libelle="X"))
+        with self.assertRaises(CommandError):
+            self.peupler()
+
+    def test_peupler_exige_confirmation(self):
+        with self.assertRaises(CommandError):
+            call_command("peupler_test", stdout=StringIO())
+
+    def test_nettoyer_refuse_si_donnees_reelles(self):
+        self.peupler(jours=1)
+        patron = Utilisateur.objects.create(
+            compte=User.objects.create_user("patron", password="Solide-2026-x"), nom="Patron",
+            telephone="700000099", role=Role.objects.get(libelle="admin"),
+        )
+        SessionCaisse.objects.create(utilisateur=patron)  # une vraie activité
+        with self.assertRaises(CommandError):
+            call_command("nettoyer_test", "--oui", stdout=StringIO())
+        self.assertTrue(Produit.objects.exists())
+        # le compte réel survit toujours à un nettoyage forcé
+        call_command("nettoyer_test", "--oui", "--force", stdout=StringIO())
+        self.assertTrue(User.objects.filter(username="patron").exists())
+        self.assertFalse(Produit.objects.exists())
