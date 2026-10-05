@@ -557,3 +557,15 @@ class ArchiveCreanceFournisseur(models.Model):
 
     def __str__(self):
         return f"Créance {self.fournisseur} archivée le {self.date_archivage:%Y-%m-%d}"
+
+class InstantaneDonneesTest(models.Model):
+    """État de la base juste avant « peupler_test --catalogue-existant » :
+    dernier identifiant de chaque table, et stock / CUMP / soldes des
+    produits, clients et fournisseurs réels. « nettoyer_test » s'en sert
+    pour effacer uniquement ce qui a été créé depuis et remettre le vrai
+    catalogue exactement dans son état d'origine. Une seule ligne au plus."""
+    date_creation = models.DateTimeField(auto_now_add=True)
+    donnees = models.JSONField()
+
+    def __str__(self):
+        return f"Instantané du {self.date_creation:%d/%m/%Y %H:%M}"
