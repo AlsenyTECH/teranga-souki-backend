@@ -386,7 +386,7 @@ class Command(BaseCommand):
         # Remboursements de crédit (espèces ou mobile money).
         for client in Client.objects.filter(id__in=[c.id for c in clients], solde_credit__gt=0):
             if self.rng.random() < 0.25:
-                montant = min(client.solde_credit, arrondi(client.solde_credit * D(self.rng.choice([0.3, 0.5, 1])), "1"))
+                montant = arrondi(min(client.solde_credit, arrondi(client.solde_credit * D(self.rng.choice([0.3, 0.5, 1])), "1")))
                 if montant > 0:
                     self.appeler(self.v["remboursement"], "post", admin, {
                         "client": client.id, "montant": str(montant),
@@ -429,7 +429,7 @@ class Command(BaseCommand):
             for utilisateur in [admin, *caissiers]:
                 session = self.appeler(self.v["courante"], "get", utilisateur).data
                 ecart = D(self.rng.choice([0, 0, 0, 0, -500, 500, -1000]))
-                compte = max(D("0"), D(session["montant_attendu"]) + ecart)
+                compte = arrondi(max(D("0"), D(session["montant_attendu"]) + ecart))
                 self.appeler(self.v["fermer"], "post", utilisateur,
                              {"montant_compte": str(compte), "commentaire": "RAS" if not ecart else "Écart constaté"},
                              pk=session["id"])
