@@ -1555,13 +1555,17 @@ def calculer_totaux_session(session):
         session.fond_ouverture + ventes_especes + remboursements_credit_especes
         - retours_especes - annulations_especes
     )
-    return {
+    totaux = {
         "ventes_especes": ventes_especes,
         "retours_especes": retours_especes,
         "annulations_especes": annulations_especes,
         "remboursements_credit_especes": remboursements_credit_especes,
         "montant_attendu": montant_attendu,
     }
+    # Toujours au centime : selon le serveur MySQL, les SUM() peuvent revenir
+    # avec des décimales parasites, que l'app renverrait ensuite telles
+    # quelles (et que DecimalField(max_digits=10) refuserait).
+    return {cle: Decimal(valeur).quantize(Decimal("0.01")) for cle, valeur in totaux.items()}
 
 
 class SessionCaisseOuvertureSerializer(serializers.Serializer):
