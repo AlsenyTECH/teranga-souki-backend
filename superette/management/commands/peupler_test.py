@@ -14,6 +14,15 @@
 #   python manage.py peupler_test --oui
 #   python manage.py peupler_test --oui --jours 10 --graine 7
 # Nettoyage complet ensuite : python manage.py nettoyer_test --oui
+#
+# Base qui contient DÉJÀ le vrai catalogue (produits saisis par le patron) :
+#   python manage.py peupler_test --oui --catalogue-existant
+# Les ventes, réceptions, etc. de test portent alors sur les vrais produits.
+# Avant de commencer, l'état du catalogue (stock, prix d'achat moyen) et des
+# clients / fournisseurs réels est photographié ; « nettoyer_test --oui »
+# efface ensuite tout ce qui a été créé depuis (y compris les essais faits
+# dans l'app avec les vrais comptes) et remet le catalogue exactement comme
+# avant. Les produits, catégories et comptes réels ne sont jamais supprimés.
 
 import random
 import secrets
@@ -27,8 +36,9 @@ from django.utils import timezone
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from superette import views
+from superette.management.commands.nettoyer_test import MODELES
 from superette.models import (
-    AjustementStock, Approvisionnement, Categorie, Client, Fournisseur, PaiementFournisseur, Produit,
+    AjustementStock, Approvisionnement, Categorie, Client, Fournisseur, InstantaneDonneesTest, PaiementFournisseur, Produit,
     RemboursementCredit, RetourAppro, RetourVente, Role, Service, SessionCaisse, TransactionCaisse, Utilisateur,
 )
 
@@ -120,6 +130,9 @@ class Command(BaseCommand):
         parser.add_argument("--graine", type=int, default=2026, help="Graine aléatoire (même graine = mêmes données).")
         parser.add_argument("--mot-de-passe", dest="mot_de_passe", default=None,
                             help="Mot de passe des comptes de test (sinon généré aléatoirement et affiché).")
+        parser.add_argument("--catalogue-existant", dest="catalogue_existant", action="store_true",
+                            help="Utilise les produits déjà en base au lieu de créer un catalogue de test ; "
+                                 "nettoyer_test remettra ensuite ces produits dans leur état actuel.")
 
     # ------------------------------------------------------------ outillage
 
@@ -185,6 +198,35 @@ class Command(BaseCommand):
                 produit.prix_achat_reference = D(prix_achat)
                 produits.append(produit)
         return produits
+
+    def catalogue_existant(self):
+        produits = list(Produit.objects.filter(actif=True, prix_vente__gt=0).order_by("pk"))
+        if len(produits) < 5:
+            raise CommandError("Il faut au moins 5 produits actifs avec un prix de vente pour --catalogue-existant.")
+        for produit in produits:
+            # Prix d'achat des réceptions de test : le CUMP réel s'il est connu,
+            # sinon 80 % du prix de vente (marge plausible).
+            produit.prix_achat_reference = (
+                produit.prix_achat_moyen if produit.prix_achat_moyen > 0 else arrondi(produit.prix_vente * D("0.8"), "1")
+            )
+        return produits
+
+    def photographier(self):
+        """Enregistre l'état de la base avant toute donnée de test (voir
+        InstantaneDonneesTest et nettoyer_test)."""
+        reperes = {
+            modele.__name__: modele.objects.order_by("-pk").values_list("pk", flat=True).first() or 0
+            for modele in MODELES
+        }
+        InstantaneDonneesTest.objects.create(donnees={
+            "reperes": reperes,
+            "produits": {str(pk): {"quantite_stock": str(q), "prix_achat_moyen": str(c)}
+                         for pk, q, c in Produit.objects.values_list("pk", "quantite_stock", "prix_achat_moyen")},
+            "clients": {str(pk): {"solde_credit": str(s), "points_fidelite": pts}
+                        for pk, s, pts in Client.objects.values_list("pk", "solde_credit", "points_fidelite")},
+            "fournisseurs": {str(pk): {"solde_du": str(s)}
+                             for pk, s in Fournisseur.objects.values_list("pk", "solde_du")},
+        })
 
     # ------------------------------------------------------------ opérations métier
 
@@ -393,7 +435,7 @@ class Command(BaseCommand):
     def reception_annulee(self, admin, produits, fournisseurs):
         """Réception saisie par erreur puis annulée aussitôt (stock, CUMP et
         dette fournisseur reviennent à leur état d'avant)."""
-        produit = self.rng.choice([p for p in produits if p.unite_vente == "unite"])
+        produit = self.rng.choice([p for p in produits if p.unite_vente == "unite"] or produits)
         appro = self.recevoir(admin, self.rng.choice(fournisseurs), [
             {"produit": produit.id, "quantite_recue": 12, "prix_unitaire_achat": str(produit.prix_achat_reference)},
         ], mode="credit")
@@ -403,7 +445,8 @@ class Command(BaseCommand):
     def stocks_bas(self, admin, produits):
         """Amène 3 produits sous leur seuil d'alerte (inventaire), pour tester
         les alertes de stock bas du tableau de bord."""
-        for produit in self.rng.sample([p for p in produits if p.quantite_stock > p.seuil_alerte], k=3):
+        candidats = [p for p in produits if p.quantite_stock > p.seuil_alerte]
+        for produit in self.rng.sample(candidats, k=min(3, len(candidats))):
             cible = max(D("0"), produit.seuil_alerte - 1)
             self.appeler(self.v["ajustement"], "post", admin, {
                 "produit": produit.id, "delta": str(cible - produit.quantite_stock), "motif": "comptage",
@@ -459,10 +502,14 @@ class Command(BaseCommand):
             raise CommandError("Ajoute --oui pour confirmer la création des données de test.")
         if User.objects.filter(username__startswith=PREFIXE_COMPTE).exists():
             raise CommandError("Des comptes test_* existent déjà : lance d'abord « nettoyer_test --oui ».")
-        if Produit.objects.exists() or TransactionCaisse.objects.exists():
+        if InstantaneDonneesTest.objects.exists():
+            raise CommandError("Des données de test sont déjà en place : lance d'abord « nettoyer_test --oui ».")
+        catalogue_existant = options["catalogue_existant"]
+        if not catalogue_existant and (Produit.objects.exists() or TransactionCaisse.objects.exists()):
             raise CommandError(
                 "La base contient déjà des produits ou des ventes : peupler_test ne s'utilise que sur une base vide "
-                "(pour ne jamais mélanger données réelles et données de test)."
+                "(pour ne jamais mélanger données réelles et données de test). Pour tester sur ton vrai "
+                "catalogue, ajoute --catalogue-existant : il sera remis dans son état actuel au nettoyage."
             )
         jours = options["jours"]
         if not 1 <= jours <= 120:
@@ -474,11 +521,24 @@ class Command(BaseCommand):
         mot_de_passe = options["mot_de_passe"] or f"Ts-{secrets.token_urlsafe(9)}"
 
         with transaction.atomic():
+            if catalogue_existant:
+                self.photographier()
+                produits = self.catalogue_existant()
             comptes = self.creer_comptes(mot_de_passe)
-            produits = self.creer_catalogue()
-            fournisseurs = [Fournisseur.objects.create(nom=n, contact=c) for n, c in FOURNISSEURS]
-            clients = [Client.objects.create(nom=n, telephone=t, adresse=a) for n, t, a in CLIENTS]
-            services = [Service.objects.create(libelle=l, tarif=D(t)) for l, t in SERVICES]
+            if not catalogue_existant:
+                produits = self.creer_catalogue()
+            # Sur une base réelle, les fiches de test sont marquées « (test) »
+            # pour ne jamais les confondre avec les vrais clients/fournisseurs.
+            suffixe = " (test)" if catalogue_existant else ""
+            fournisseurs = [Fournisseur.objects.create(nom=n + suffixe, contact=c) for n, c in FOURNISSEURS]
+            clients = [
+                Client.objects.create(
+                    nom=n + suffixe, adresse=a,
+                    telephone=None if Client.objects.filter(telephone=t).exists() else t,
+                ) for n, t, a in CLIENTS
+            ]
+            services = list(Service.objects.all()) if catalogue_existant else []
+            services = services or [Service.objects.create(libelle=l + suffixe, tarif=D(t)) for l, t in SERVICES]
 
             aujourd_hui = timezone.localdate()
             premier_jour = aujourd_hui - timedelta(days=jours)
@@ -504,5 +564,8 @@ class Command(BaseCommand):
             f"  test_admin      admin\n"
             f"  test_caissier1  caissier (sans permission supplémentaire)\n"
             f"  test_caissier2  caissier avec permissions « remises » et « clients »\n\n"
-            f"Tout effacer ensuite : python manage.py nettoyer_test --oui"
+            + (f"Nettoyage (le catalogue réel est conservé et remis dans son état d'avant) :\n"
+               f"  python manage.py nettoyer_test --oui"
+               if catalogue_existant else
+               f"Tout effacer ensuite : python manage.py nettoyer_test --oui")
         ))

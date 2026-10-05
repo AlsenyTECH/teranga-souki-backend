@@ -9,6 +9,16 @@
 # n'est PAS un compte de test — signe que la base contient de vraies données.
 #
 #   python manage.py nettoyer_test --oui
+#
+# Après « peupler_test --catalogue-existant » (un instantané existe) : seul
+# ce qui a été créé APRÈS l'instantané est effacé — données de test ET essais
+# faits dans l'app pendant la période de test, quel que soit le compte —, puis
+# le stock et le prix d'achat moyen des produits, et les soldes des clients /
+# fournisseurs réels, reprennent leur valeur d'avant. Les produits et
+# catégories (y compris ceux ajoutés pendant les tests) et les comptes réels
+# sont conservés.
+
+from decimal import Decimal
 
 from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand, CommandError
@@ -16,7 +26,7 @@ from django.db import transaction
 
 from superette.models import (
     AjustementStock, Approvisionnement, ArchiveCreanceClient, ArchiveCreanceFournisseur, Categorie, Client,
-    Depense, Fournisseur, LigneAppro, LigneRetour, LigneRetourAppro, LigneVente, PaiementFournisseur,
+    Depense, Fournisseur, InstantaneDonneesTest, LigneAppro, LigneRetour, LigneRetourAppro, LigneVente, PaiementFournisseur,
     PaiementVente, PrestationService, Produit, RemboursementCredit, RetourAppro, RetourVente, Service,
     SessionCaisse, TransactionCaisse, Utilisateur, VenteProduits,
 )
@@ -54,6 +64,9 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         if not options["oui"]:
             raise CommandError("Suppression définitive : ajoute --oui pour confirmer.")
+        instantane = InstantaneDonneesTest.objects.order_by("pk").first()
+        if instantane is not None:
+            return self.restaurer(instantane)
 
         comptes_test = Utilisateur.objects.filter(compte__username__startswith=PREFIXE_COMPTE)
         if not options["force"]:
@@ -84,4 +97,43 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             "Base nettoyée.\n  " + ("\n  ".join(bilan) or "aucune donnée métier") +
             f"\n  comptes de test supprimés : {n_comptes}"
+        ))
+
+    def restaurer(self, instantane):
+        """Nettoyage après « peupler_test --catalogue-existant »."""
+        donnees = instantane.donnees
+        reperes = donnees["reperes"]
+        with transaction.atomic():
+            bilan = []
+            for modele in MODELES:
+                if modele in (Produit, Categorie):
+                    continue  # le catalogue reste, seul son état est restauré
+                nouveaux = modele.objects.filter(pk__gt=reperes.get(modele.__name__, 0))
+                n = nouveaux.count()
+                nouveaux.delete()
+                if n:
+                    bilan.append(f"{modele.__name__} : {n}")
+
+            anciens = donnees["produits"]
+            for produit in Produit.objects.select_for_update():
+                etat = anciens.get(str(produit.pk))
+                # Produit ajouté pendant les tests : on le garde, sans stock.
+                produit.quantite_stock = Decimal(etat["quantite_stock"]) if etat else Decimal("0")
+                produit.prix_achat_moyen = Decimal(etat["prix_achat_moyen"]) if etat else Decimal("0")
+                produit.save(update_fields=["quantite_stock", "prix_achat_moyen"])
+            for pk, etat in donnees["clients"].items():
+                Client.objects.filter(pk=pk).update(
+                    solde_credit=Decimal(etat["solde_credit"]), points_fidelite=etat["points_fidelite"])
+            for pk, etat in donnees["fournisseurs"].items():
+                Fournisseur.objects.filter(pk=pk).update(solde_du=Decimal(etat["solde_du"]))
+
+            n_comptes = User.objects.filter(username__startswith=PREFIXE_COMPTE).count()
+            User.objects.filter(username__startswith=PREFIXE_COMPTE).delete()
+            InstantaneDonneesTest.objects.all().delete()
+
+        self.stdout.write(self.style.SUCCESS(
+            f"Données de test effacées (instantané du {instantane.date_creation:%d/%m/%Y %H:%M}).\n  "
+            + ("\n  ".join(bilan) or "aucune donnée créée depuis l'instantané")
+            + f"\n  comptes de test supprimés : {n_comptes}"
+            + f"\n  {Produit.objects.count()} produits conservés, stock et prix d'achat remis à leur état d'avant."
         ))

@@ -20,6 +20,7 @@ from rest_framework.test import APIClient
 from .models import (
     Role, Utilisateur, Categorie, Produit, Client, Fournisseur, Service,
     SessionCaisse, TransactionCaisse, Approvisionnement, RemboursementCredit,
+    AjustementStock, Depense, InstantaneDonneesTest, LigneVente,
 )
 
 D = Decimal
@@ -645,3 +646,81 @@ class DonneesDeTestTests(TestCase):
         call_command("nettoyer_test", "--oui", "--force", stdout=StringIO())
         self.assertTrue(User.objects.filter(username="patron").exists())
         self.assertFalse(Produit.objects.exists())
+
+
+class DonneesDeTestCatalogueExistantTests(TestCase):
+    """peupler_test --catalogue-existant sur une base qui contient le vrai
+    catalogue : nettoyer_test doit tout remettre exactement comme avant."""
+
+    def setUp(self):
+        categorie = Categorie.objects.create(libelle="Boissons")
+        self.produits = [
+            Produit.objects.create(nom=f"Réel {i}", prix_vente=D(500 + 100 * i), categorie=categorie,
+                                   quantite_stock=D(10 * i), prix_achat_moyen=D(400 + 50 * i) if i % 2 else D("0"))
+            for i in range(6)
+        ]
+        self.produits.append(Produit.objects.create(nom="Oignon", prix_vente=D("600"), unite_vente="kg",
+                                                    categorie=categorie, quantite_stock=D("12.5")))
+        self.client_reel = Client.objects.create(nom="Vraie cliente", telephone="771000001",
+                                                 solde_credit=D("2500"), points_fidelite=4)
+        self.fournisseur_reel = Fournisseur.objects.create(nom="Vrai grossiste", solde_du=D("10000"))
+        self.patronne = Utilisateur.objects.create(
+            compte=User.objects.create_user("souki", password="Solide-2026-x"), nom="Yaye Fatou Ndiaye",
+            telephone="700000099", role=Role.objects.create(libelle="admin"),
+        )
+        self.avant = {p.pk: (p.quantite_stock, p.prix_achat_moyen) for p in Produit.objects.all()}
+
+    def peupler(self, *extra):
+        call_command("peupler_test", "--oui", "--jours", "3", "--mot-de-passe", "Test-Teranga-2026",
+                     "--catalogue-existant", *extra, stdout=StringIO())
+
+    def test_peupler_sur_catalogue_reel_puis_restaurer(self):
+        self.peupler()
+        self.assertEqual(Produit.objects.count(), 7)  # aucun produit de test créé
+        self.assertGreater(TransactionCaisse.objects.count(), 20)
+        self.assertTrue(LigneVente.objects.filter(produit__in=self.produits).exists())
+        self.assertTrue(Client.objects.filter(nom="Awa Ndiaye (test)", telephone__isnull=True).exists())
+        self.assertFalse(Produit.objects.filter(quantite_stock__lt=0).exists())
+
+        # Pendant la période de test : une vente faite avec le vrai compte et
+        # un nouveau produit ajouté au catalogue.
+        api = APIClient()
+        api.force_authenticate(self.patronne.compte)
+        self.assertEqual(api.post("/api/sessions-caisse/ouvrir/", {"fond_ouverture": "0"}, format="json").status_code,
+                         201)
+        r = api.post("/api/ventes/", {"mode_paiement": "credit", "client": self.client_reel.id, "lignes": [
+            {"produit": self.produits[3].id, "quantite": "1", "prix_unitaire_vente": "800"}]}, format="json")
+        self.assertEqual(r.status_code, 201, r.data)
+        nouveau = Produit.objects.create(nom="Ajouté pendant les tests", prix_vente=D("100"),
+                                         categorie=Categorie.objects.first(), quantite_stock=D("9"))
+
+        call_command("nettoyer_test", "--oui", stdout=StringIO())
+
+        for p in Produit.objects.exclude(pk=nouveau.pk):
+            self.assertEqual((p.quantite_stock, p.prix_achat_moyen), self.avant[p.pk], p.nom)
+        nouveau.refresh_from_db()
+        self.assertEqual(nouveau.quantite_stock, D("0"))
+        self.client_reel.refresh_from_db()
+        self.assertEqual((self.client_reel.solde_credit, self.client_reel.points_fidelite), (D("2500"), 4))
+        self.fournisseur_reel.refresh_from_db()
+        self.assertEqual(self.fournisseur_reel.solde_du, D("10000"))
+        self.assertEqual(list(Client.objects.all()), [self.client_reel])
+        self.assertEqual(list(Fournisseur.objects.all()), [self.fournisseur_reel])
+        for modele in (TransactionCaisse, SessionCaisse, Approvisionnement, AjustementStock, Depense):
+            self.assertFalse(modele.objects.exists(), modele.__name__)
+        self.assertFalse(User.objects.filter(username__startswith="test_").exists())
+        self.assertTrue(User.objects.filter(username="souki").exists())
+        self.assertFalse(InstantaneDonneesTest.objects.exists())
+        # Et on peut recommencer un cycle de test.
+        self.peupler()
+
+    def test_refuse_un_second_peuplement(self):
+        # Instantané laissé par un peuplement précédent, même sans comptes test_*.
+        InstantaneDonneesTest.objects.create(donnees={})
+        with self.assertRaises(CommandError):
+            self.peupler()
+
+    def test_sans_option_la_base_reelle_est_refusee(self):
+        with self.assertRaises(CommandError):
+            call_command("peupler_test", "--oui", stdout=StringIO())
+        self.assertFalse(InstantaneDonneesTest.objects.exists())
