@@ -43,6 +43,8 @@ from superette.models import (
 )
 
 PREFIXE_COMPTE = "test_"
+# En dessous, --catalogue-existant complète avec le catalogue de test.
+MINIMUM_PRODUITS = 15
 D = Decimal
 
 CATALOGUE = {
@@ -186,10 +188,16 @@ class Command(BaseCommand):
         return resultat
 
     def creer_catalogue(self):
+        """Crée le catalogue de test. Sur une base réelle, les produits dont le
+        nom existe déjà sont sautés et un code-barres déjà pris est laissé vide."""
         produits = []
         for libelle, lignes in CATALOGUE.items():
             categorie, _ = Categorie.objects.get_or_create(libelle=libelle)
             for nom, prix_vente, prix_achat, unite, gros, code in lignes:
+                if Produit.objects.filter(nom__iexact=nom).exists():
+                    continue
+                if code and Produit.objects.filter(code_barre=code).exists():
+                    code = None
                 produit = Produit.objects.create(
                     nom=nom, prix_vente=D(prix_vente), unite_vente=unite, categorie=categorie,
                     code_barre=code, seuil_alerte=D("5") if unite == "unite" else D("3"),
@@ -201,14 +209,20 @@ class Command(BaseCommand):
 
     def catalogue_existant(self):
         produits = list(Produit.objects.filter(actif=True, prix_vente__gt=0).order_by("pk"))
-        if len(produits) < 5:
-            raise CommandError("Il faut au moins 5 produits actifs avec un prix de vente pour --catalogue-existant.")
         for produit in produits:
             # Prix d'achat des réceptions de test : le CUMP réel s'il est connu,
             # sinon 80 % du prix de vente (marge plausible).
             produit.prix_achat_reference = (
                 produit.prix_achat_moyen if produit.prix_achat_moyen > 0 else arrondi(produit.prix_vente * D("0.8"), "1")
             )
+        if len(produits) < MINIMUM_PRODUITS:
+            # Catalogue réel trop maigre pour des tests parlants : on le complète
+            # avec le catalogue de test, que nettoyer_test supprimera ensuite.
+            ajoutes = self.creer_catalogue()
+            instantane = InstantaneDonneesTest.objects.get()
+            instantane.donnees["produits_test"] = [p.pk for p in ajoutes]
+            instantane.save(update_fields=["donnees"])
+            produits += ajoutes
         return produits
 
     def photographier(self):
