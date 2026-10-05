@@ -60,16 +60,21 @@ class Command(BaseCommand):
             "--force", action="store_true",
             help="Supprime même si des opérations ont été faites avec des comptes non-test (DANGEREUX).",
         )
+        parser.add_argument(
+            "--tout", action="store_true",
+            help="Remise à zéro complète : efface TOUTES les données métier (produits compris), même après "
+                 "--catalogue-existant et même celles saisies avec les vrais comptes. Les comptes réels restent.",
+        )
 
     def handle(self, *args, **options):
         if not options["oui"]:
             raise CommandError("Suppression définitive : ajoute --oui pour confirmer.")
         instantane = InstantaneDonneesTest.objects.order_by("pk").first()
-        if instantane is not None:
+        if instantane is not None and not options["tout"]:
             return self.restaurer(instantane)
 
         comptes_test = Utilisateur.objects.filter(compte__username__startswith=PREFIXE_COMPTE)
-        if not options["force"]:
+        if not (options["force"] or options["tout"]):
             reels = {
                 modele.__name__: modele.objects.exclude(utilisateur__in=comptes_test).count()
                 for modele in AVEC_UTILISATEUR
@@ -93,6 +98,7 @@ class Command(BaseCommand):
             n_comptes = User.objects.filter(username__startswith=PREFIXE_COMPTE).count()
             # Le profil Utilisateur (et les jetons) partent avec le compte (CASCADE).
             User.objects.filter(username__startswith=PREFIXE_COMPTE).delete()
+            InstantaneDonneesTest.objects.all().delete()
 
         self.stdout.write(self.style.SUCCESS(
             "Base nettoyée.\n  " + ("\n  ".join(bilan) or "aucune donnée métier") +
@@ -126,6 +132,15 @@ class Command(BaseCommand):
                     solde_credit=Decimal(etat["solde_credit"]), points_fidelite=etat["points_fidelite"])
             for pk, etat in donnees["fournisseurs"].items():
                 Fournisseur.objects.filter(pk=pk).update(solde_du=Decimal(etat["solde_du"]))
+
+            # Produits du catalogue de test ajoutés pour compléter le vrai.
+            produits_test = Produit.objects.filter(pk__in=donnees.get("produits_test", []))
+            n_produits_test = produits_test.count()
+            produits_test.delete()
+            n_categories = Categorie.objects.filter(
+                pk__gt=reperes.get("Categorie", 0), produit__isnull=True).delete()[0]
+            if n_produits_test:
+                bilan.append(f"produits de test : {n_produits_test} (catégories vides : {n_categories})")
 
             n_comptes = User.objects.filter(username__startswith=PREFIXE_COMPTE).count()
             User.objects.filter(username__startswith=PREFIXE_COMPTE).delete()

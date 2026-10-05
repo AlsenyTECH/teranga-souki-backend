@@ -676,7 +676,8 @@ class DonneesDeTestCatalogueExistantTests(TestCase):
 
     def test_peupler_sur_catalogue_reel_puis_restaurer(self):
         self.peupler()
-        self.assertEqual(Produit.objects.count(), 7)  # aucun produit de test créé
+        # catalogue réel trop petit (7 < 15) : complété par le catalogue de test
+        self.assertGreater(Produit.objects.count(), 20)
         self.assertGreater(TransactionCaisse.objects.count(), 20)
         self.assertTrue(LigneVente.objects.filter(produit__in=self.produits).exists())
         self.assertTrue(Client.objects.filter(nom="Awa Ndiaye (test)", telephone__isnull=True).exists())
@@ -696,6 +697,8 @@ class DonneesDeTestCatalogueExistantTests(TestCase):
 
         call_command("nettoyer_test", "--oui", stdout=StringIO())
 
+        # les produits de test ajoutés sont repartis, le vrai catalogue reste
+        self.assertEqual(Produit.objects.count(), 8)
         for p in Produit.objects.exclude(pk=nouveau.pk):
             self.assertEqual((p.quantite_stock, p.prix_achat_moyen), self.avant[p.pk], p.nom)
         nouveau.refresh_from_db()
@@ -724,3 +727,18 @@ class DonneesDeTestCatalogueExistantTests(TestCase):
         with self.assertRaises(CommandError):
             call_command("peupler_test", "--oui", stdout=StringIO())
         self.assertFalse(InstantaneDonneesTest.objects.exists())
+
+    def test_grand_catalogue_reel_non_complete(self):
+        categorie = Categorie.objects.first()
+        for i in range(10):
+            Produit.objects.create(nom=f"Autre {i}", prix_vente=D("250"), categorie=categorie)
+        self.peupler()
+        self.assertEqual(Produit.objects.count(), 17)
+
+    def test_nettoyer_tout_remet_a_zero(self):
+        self.peupler()
+        call_command("nettoyer_test", "--oui", "--tout", stdout=StringIO())
+        for modele in (Produit, Categorie, Client, Fournisseur, TransactionCaisse, InstantaneDonneesTest):
+            self.assertFalse(modele.objects.exists(), modele.__name__)
+        self.assertTrue(User.objects.filter(username="souki").exists())
+        self.assertFalse(User.objects.filter(username__startswith="test_").exists())
