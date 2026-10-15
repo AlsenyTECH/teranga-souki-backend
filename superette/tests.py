@@ -18,8 +18,8 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
 from .models import (
-    Role, Utilisateur, Categorie, Produit, Client, Fournisseur, Service,
-    SessionCaisse, TransactionCaisse, Approvisionnement, RemboursementCredit,
+    Role, Utilisateur, Categorie, Produit, Client, Fournisseur,
+    SessionCaisse, TransactionCaisse, Approvisionnement, RemboursementCredit, Employe,
     AjustementStock, Depense, InstantaneDonneesTest, LigneVente,
 )
 
@@ -433,16 +433,21 @@ class RapportTests(BaseTest):
         self.assertEqual(r["retours_ventes"], D("900.00"))
         self.assertEqual(r["marge_brute_ventes"], D("300.00"))
 
-    def test_resultat_net_retire_le_cout_des_marchandises(self):
-        # 2 riz à 1000 (CUMP 600) -> marge 800 ; prestation 250 ; dépense 300
+    def test_resultat_net_retire_cout_depenses_et_salaires(self):
+        # 2 riz à 1000 (CUMP 600) -> marge 800 ; dépense 300 ; salaire 200
         self.vendre(self.api_admin, [{"produit": self.riz.id, "quantite": 2}])
-        service = Service.objects.create(libelle="Déplumage", tarif=D("250"))
-        self.api_admin.post("/api/prestations/", {"service": service.id, "mode_paiement": "especes"}, format="json")
         self.api_admin.post("/api/depenses/", {"montant": "300", "categorie": "Transport",
                                                "date_depense": self.jour}, format="json")
+        employe = Employe.objects.create(nom="Babacar", salaire_mensuel=D("60000"))
+        r = self.api_admin.post("/api/paiements-salaire/", {
+            "employe": employe.id, "mois": self.jour, "type_paiement": "avance", "montant": "200",
+            "date_paiement": self.jour,
+        }, format="json")
+        self.assertEqual(r.status_code, 201, r.data)
         r = self.api_admin.get(f"/api/rapports/?date={self.jour}").data
-        self.assertEqual(r["chiffre_affaires_total"], D("2250.00"))
-        self.assertEqual(r["resultat_net"], D("750.00"))  # 800 + 250 - 300, pas 2250 - 300
+        self.assertEqual(r["chiffre_affaires_total"], D("2000.00"))
+        self.assertEqual(r["total_salaires"], D("200.00"))
+        self.assertEqual(r["resultat_net"], D("300.00"))  # 800 - 300 - 200
 
     def test_periode_et_journalier_coherents_et_mixte_ventile(self):
         self.vendre(self.api_admin, [{"produit": self.riz.id, "quantite": 2}], mode_paiement="mixte",
@@ -574,21 +579,181 @@ class SeedDemoTests(TestCase):
             call_command("seed_demo", stdout=StringIO())
 
 
-class PrestationTests(BaseTest):
-    def test_prestation_et_annulation(self):
-        self.ouvrir_session(self.api_caissier)
-        self.ouvrir_session(self.api_admin)
-        service = Service.objects.create(libelle="Déplumage", tarif=D("250"))
-        r = self.api_caissier.post("/api/prestations/", {"service": service.id, "quantite": 4, "mode_paiement": "especes"}, format="json")
+class ServicesSupprimesTests(BaseTest):
+    def test_plus_de_services_ni_prestations(self):
+        self.assertEqual(self.api_admin.get("/api/services/").status_code, 404)
+        self.assertEqual(self.api_admin.post("/api/prestations/", {}, format="json").status_code, 404)
+
+
+# ============================================================
+# Péremption, inventaire, salaires, comptabilité, sauvegarde
+# ============================================================
+
+class PeremptionTests(BaseTest):
+    def recevoir(self, date_peremption, quantite=10):
+        r = self.api_admin.post("/api/approvisionnements/", {
+            "fournisseur": self.fournisseur.id,
+            "lignes": [{"produit": self.huile.id, "quantite_recue": quantite, "prix_unitaire_achat": "300",
+                        "date_peremption": date_peremption}],
+        }, format="json")
         self.assertEqual(r.status_code, 201, r.data)
-        self.assertEqual(D(r.data["montant_total"]), D("1000"))
-        r2 = self.api_admin.post(f"/api/ventes/{r.data['id']}/annuler/")
-        self.assertEqual(r2.status_code, 200, r2.data)
-        caisse = self.api_caissier.get("/api/sessions-caisse/courante/").data
-        # vente comptée dans la session caissier, annulation sortie de la session admin
-        self.assertEqual(D(caisse["montant_attendu"]), D("1000"))
-        self.assertEqual(len(self.api_caissier.get("/api/prestations/").data), 1)
-        self.assertTrue(Approvisionnement.objects.count() == 0)
+        return r.data
+
+    def setUp(self):
+        super().setUp()
+        self.fournisseur = Fournisseur.objects.create(nom="Grossiste")
+
+    def test_le_produit_garde_la_peremption_la_plus_proche(self):
+        a = self.recevoir("2026-12-31")
+        self.assertEqual(a["lignes"][0]["date_peremption"], "2026-12-31")
+        self.recharger(self.huile)
+        self.assertEqual(str(self.huile.date_peremption), "2026-12-31")
+        self.recevoir("2027-03-01")  # lot plus lointain : la date la plus proche reste
+        self.recharger(self.huile)
+        self.assertEqual(str(self.huile.date_peremption), "2026-12-31")
+        self.recevoir("2026-11-15")
+        self.recharger(self.huile)
+        self.assertEqual(str(self.huile.date_peremption), "2026-11-15")
+        produit = self.api_admin.get(f"/api/produits/{self.huile.id}/").data
+        self.assertEqual(produit["date_peremption"], "2026-11-15")
+
+    def test_rayon_vide_prend_la_date_du_nouveau_lot(self):
+        Produit.objects.filter(pk=self.huile.pk).update(quantite_stock=0, date_peremption="2026-01-01")
+        self.recevoir("2027-05-01")
+        self.recharger(self.huile)
+        self.assertEqual(str(self.huile.date_peremption), "2027-05-01")
+
+    def test_date_modifiable_a_la_main(self):
+        r = self.api_admin.patch(f"/api/produits/{self.huile.id}/", {"date_peremption": "2026-10-30"}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        r = self.api_admin.patch(f"/api/produits/{self.huile.id}/", {"date_peremption": None}, format="json")
+        self.assertIsNone(r.data["date_peremption"])
+
+    def test_motif_perime_accepte(self):
+        r = self.api_admin.post("/api/ajustements-stock/", {"produit": self.huile.id, "delta": "-2", "motif": "perime"},
+                                format="json")
+        self.assertEqual(r.status_code, 201, r.data)
+
+
+class InventaireTests(BaseTest):
+    def test_inventaire_complet(self):
+        r = self.api_admin.post("/api/inventaires/", {"libelle": "Fin de mois"}, format="json")
+        self.assertEqual(r.status_code, 201, r.data)
+        inv = r.data["id"]
+        # un seul inventaire en cours
+        self.assertEqual(self.api_admin.post("/api/inventaires/", {}, format="json").status_code, 400)
+        # riz : 50 en théorie, 47 comptés ; huile : juste
+        self.api_admin.post(f"/api/inventaires/{inv}/lignes/", {"produit": self.riz.id, "quantite_comptee": "47"}, format="json")
+        r = self.api_admin.post(f"/api/inventaires/{inv}/lignes/", {"produit": self.huile.id, "quantite_comptee": "50"}, format="json")
+        self.assertEqual(r.data["nb_lignes"], 2)
+        self.assertEqual(r.data["nb_ecarts"], 1)
+        self.assertEqual(D(str(r.data["valeur_ecarts"])), D("-1800"))  # -3 x CUMP 600
+        # quantité non entière refusée pour un produit à l'unité
+        r = self.api_admin.post(f"/api/inventaires/{inv}/lignes/", {"produit": self.riz.id, "quantite_comptee": "1.5"}, format="json")
+        self.assertEqual(r.status_code, 400)
+        # une vente pendant l'inventaire : l'écart se calcule sur le stock au moment de la validation
+        self.ouvrir_session(self.api_admin)
+        self.vendre(self.api_admin, [{"produit": self.huile.id, "quantite": 2}])
+        r = self.api_admin.post(f"/api/inventaires/{inv}/valider/")
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(r.data["statut"], "valide")
+        self.recharger(self.riz, self.huile)
+        self.assertEqual(self.riz.quantite_stock, D("47"))
+        self.assertEqual(self.huile.quantite_stock, D("50"))
+        self.assertEqual(AjustementStock.objects.filter(inventaire_id=inv).count(), 2)
+        # figé après validation
+        self.assertEqual(self.api_admin.post(f"/api/inventaires/{inv}/valider/").status_code, 400)
+        self.assertEqual(self.api_admin.delete(f"/api/inventaires/{inv}/").status_code, 400)
+        self.assertEqual(self.api_admin.post(f"/api/inventaires/{inv}/lignes/",
+                                             {"produit": self.riz.id, "quantite_comptee": "1"}, format="json").status_code, 400)
+
+    def test_abandon_et_droits(self):
+        self.assertEqual(self.api_caissier.post("/api/inventaires/", {}, format="json").status_code, 403)
+        inv = self.api_admin.post("/api/inventaires/", {}, format="json").data["id"]
+        self.assertEqual(self.api_admin.post(f"/api/inventaires/{inv}/valider/").status_code, 400)  # vide
+        self.assertEqual(self.api_admin.delete(f"/api/inventaires/{inv}/").status_code, 204)
+        self.recharger(self.riz)
+        self.assertEqual(self.riz.quantite_stock, D("50"))
+
+
+class SalaireTests(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.employe = Employe.objects.create(nom="Babacar", poste="Aide", salaire_mensuel=D("60000"))
+
+    def payer(self, montant, type_paiement="salaire", mois="2026-10-01", attendu=201):
+        r = self.api_admin.post("/api/paiements-salaire/", {
+            "employe": self.employe.id, "mois": mois, "type_paiement": type_paiement, "montant": montant,
+            "date_paiement": "2026-10-15", "mode_paiement": "wave",
+        }, format="json")
+        self.assertEqual(r.status_code, attendu, r.data)
+        return r.data
+
+    def test_avance_puis_solde_puis_plafond(self):
+        p = self.payer("20000", "avance", mois="2026-10-12")
+        self.assertEqual(p["mois"], "2026-10-01")  # ramené au 1er du mois
+        self.payer("40000")
+        self.payer("1", attendu=400)  # salaire du mois déjà entièrement versé
+        self.payer("5000", "prime")  # une prime reste possible
+        self.assertEqual(len(self.api_admin.get(f"/api/paiements-salaire/?employe={self.employe.id}&mois=2026-10").data), 3)
+
+    def test_reserve_a_l_admin(self):
+        self.assertEqual(self.api_caissier.get("/api/employes/").status_code, 403)
+        self.assertEqual(self.api_caissier.get("/api/paiements-salaire/").status_code, 403)
+
+    def test_employe_paye_non_supprimable(self):
+        self.payer("1000", "avance")
+        self.assertEqual(self.api_admin.delete(f"/api/employes/{self.employe.id}/").status_code, 400)
+
+
+class ComptabiliteTests(BaseTest):
+    def test_tableau_de_bord(self):
+        jour = timezone.localdate()
+        self.ouvrir_session(self.api_admin)
+        self.vendre(self.api_admin, [{"produit": self.riz.id, "quantite": 2}])  # 2000 espèces, marge 800
+        self.vendre(self.api_admin, [{"produit": self.huile.id, "quantite": 2}], mode_paiement="mixte",
+                    client=self.client_awa.id,
+                    paiements=[{"mode_paiement": "wave", "montant": "600"}, {"mode_paiement": "credit", "montant": "400"}])
+        self.api_admin.post("/api/depenses/", {"montant": "300", "categorie": "Transport",
+                                               "date_depense": jour.isoformat()}, format="json")
+        r = self.api_admin.get(f"/api/comptabilite/?annee={jour.year}")
+        self.assertEqual(r.status_code, 200, r.data)
+        mois = r.data["mois"][-1]
+        self.assertEqual(mois["chiffre_affaires"], D("3000.00"))
+        self.assertEqual(mois["marge_brute"], D("1200.00"))
+        self.assertEqual(mois["cout_marchandises"], D("1800.00"))
+        self.assertEqual(mois["resultat_net"], D("900.00"))
+        t = r.data["tresorerie"]
+        self.assertEqual(t["encaissements"]["especes"], D("2000.00"))
+        self.assertEqual(t["encaissements"]["wave"], D("600.00"))
+        self.assertEqual(t["ventes_a_credit"], D("400.00"))
+        self.assertEqual(r.data["situation"]["creances_clients"], D("400.00"))
+        self.assertEqual(r.data["depenses_par_categorie"][0]["categorie"], "Transport")
+        self.assertEqual(self.api_caissier.get("/api/comptabilite/").status_code, 403)
+
+
+class SauvegardeTests(BaseTest):
+    def test_telechargement_admin(self):
+        import gzip, json
+        r = self.api_admin.get("/api/sauvegarde/")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("attachment", r["Content-Disposition"])
+        donnees = json.loads(gzip.decompress(r.content))
+        modeles = {o["model"] for o in donnees}
+        self.assertIn("superette.produit", modeles)
+        self.assertIn("auth.user", modeles)
+        self.assertNotIn("authtoken.token", modeles)  # jamais les jetons de connexion
+        self.assertEqual(self.api_caissier.get("/api/sauvegarde/").status_code, 403)
+
+    def test_commande_garde_les_plus_recentes(self):
+        import tempfile, pathlib
+        with tempfile.TemporaryDirectory() as dossier:
+            for i in range(3):
+                (pathlib.Path(dossier) / f"teranga-souki-2026010{i}-0000.json.gz").write_bytes(b"x")
+            call_command("sauvegarder", "--dossier", dossier, "--garder", "2", stdout=StringIO())
+            fichiers = sorted(p.name for p in pathlib.Path(dossier).iterdir())
+            self.assertEqual(len(fichiers), 2)
+            self.assertNotIn("teranga-souki-20260100-0000.json.gz", fichiers)
 
 
 # ============================================================

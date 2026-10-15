@@ -1,6 +1,8 @@
 # fichier: superette/models.py
 # Fichier déjà existant (créé par startapp) — on REMPLACE tout son contenu
 
+from decimal import Decimal
+
 from django.db import models
 from django.conf import settings
 from django.core.validators import MinValueValidator
@@ -101,6 +103,10 @@ class Produit(models.Model):
     seuil_alerte = models.DecimalField(max_digits=10, decimal_places=3, default=5, validators=[MinValueValidator(0)])
     categorie = models.ForeignKey(Categorie, on_delete=models.PROTECT)
     actif = models.BooleanField(default=True)
+    # Prochaine date de péremption du stock en rayon (le lot le plus proche
+    # d'expirer). Mise à jour à chaque réception qui en indique une, et
+    # modifiable à la main ; vide pour les produits non périssables.
+    date_peremption = models.DateField(null=True, blank=True)
 
     def __str__(self):
         return self.nom
@@ -145,14 +151,6 @@ class Fournisseur(models.Model):
 
     def __str__(self):
         return self.nom
-
-
-class Service(models.Model):
-    libelle = models.CharField(max_length=100)
-    tarif = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
-
-    def __str__(self):
-        return self.libelle
 
 
 class StatutSession(models.TextChoices):
@@ -274,17 +272,6 @@ class PaiementVente(models.Model):
         return f"{self.montant} F ({self.mode_paiement}) sur vente #{self.vente_id}"
 
 
-class PrestationService(models.Model):
-    transaction = models.OneToOneField(
-        TransactionCaisse, on_delete=models.CASCADE, primary_key=True
-    )
-    service = models.ForeignKey(Service, on_delete=models.PROTECT)
-    quantite = models.PositiveIntegerField(default=1)
-
-    def __str__(self):
-        return f"Prestation #{self.transaction_id} - {self.service}"
-
-
 class LigneVente(models.Model):
     quantite = models.DecimalField(max_digits=10, decimal_places=3, validators=[MinValueValidator(0.001)])
     prix_unitaire_vente = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
@@ -390,6 +377,8 @@ class LigneAppro(models.Model):
     quantite_par_lot = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True, validators=[MinValueValidator(0.001)])
     appro = models.ForeignKey(Approvisionnement, on_delete=models.CASCADE, related_name="lignes")
     produit = models.ForeignKey(Produit, on_delete=models.PROTECT)
+    # Date de péremption du lot reçu (facultative).
+    date_peremption = models.DateField(null=True, blank=True)
 
     def __str__(self):
         return f"{self.quantite_recue} x {self.produit}"
@@ -459,6 +448,7 @@ class MotifAjustement(models.TextChoices):
     VOL = "vol", "Vol"
     COMPTAGE = "comptage", "Comptage physique"
     ERREUR = "erreur", "Erreur de saisie"
+    PERIME = "perime", "Produit périmé"
     AUTRE = "autre", "Autre"
 
 
@@ -472,6 +462,10 @@ class AjustementStock(models.Model):
     commentaire = models.CharField(max_length=255, blank=True)
     utilisateur = models.ForeignKey(Utilisateur, on_delete=models.PROTECT)
     date_heure = models.DateTimeField(auto_now_add=True)
+    # Renseigné quand l'ajustement vient de la validation d'un inventaire.
+    inventaire = models.ForeignKey(
+        "Inventaire", on_delete=models.PROTECT, null=True, blank=True, related_name="ajustements"
+    )
 
     def __str__(self):
         return f"{self.produit} {self.delta:+} ({self.motif})"
@@ -569,3 +563,93 @@ class InstantaneDonneesTest(models.Model):
 
     def __str__(self):
         return f"Instantané du {self.date_creation:%d/%m/%Y %H:%M}"
+
+
+# ============================================================
+# Inventaire — comptage physique du stock. Tant qu'il est « en cours »,
+# on saisit les quantités comptées produit par produit ; à la validation,
+# chaque écart devient un AjustementStock (motif « comptage ») tracé et
+# rattaché à l'inventaire. Un seul inventaire en cours à la fois.
+# ============================================================
+
+class StatutInventaire(models.TextChoices):
+    EN_COURS = "en_cours", "En cours"
+    VALIDE = "valide", "Validé"
+
+
+class Inventaire(models.Model):
+    libelle = models.CharField(max_length=100, blank=True)
+    statut = models.CharField(max_length=10, choices=StatutInventaire.choices, default=StatutInventaire.EN_COURS)
+    utilisateur = models.ForeignKey(Utilisateur, on_delete=models.PROTECT, related_name="inventaires")
+    date_creation = models.DateTimeField(auto_now_add=True)
+    date_validation = models.DateTimeField(null=True, blank=True)
+    commentaire = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        ordering = ["-date_creation"]
+
+    def __str__(self):
+        return f"Inventaire #{self.pk} ({self.statut})"
+
+
+class LigneInventaire(models.Model):
+    inventaire = models.ForeignKey(Inventaire, on_delete=models.CASCADE, related_name="lignes")
+    produit = models.ForeignKey(Produit, on_delete=models.PROTECT)
+    # Figés à la validation (stock théorique et CUMP du moment), pour que le
+    # rapport d'inventaire reste juste même si le stock bouge ensuite.
+    quantite_comptee = models.DecimalField(max_digits=10, decimal_places=3, validators=[MinValueValidator(0)])
+    stock_theorique = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    prix_achat_moyen = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["inventaire", "produit"], name="ligne_inventaire_unique")]
+
+    def __str__(self):
+        return f"{self.produit} : {self.quantite_comptee}"
+
+
+# ============================================================
+# Employés et salaires — fiches indépendantes des comptes de connexion
+# (une aide au rayon peut être payée sans avoir accès à l'app).
+# ============================================================
+
+class Employe(models.Model):
+    nom = models.CharField(max_length=100)
+    telephone = models.CharField(max_length=20, blank=True)
+    poste = models.CharField(max_length=60, blank=True)
+    salaire_mensuel = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
+    date_embauche = models.DateField(null=True, blank=True)
+    actif = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["nom"]
+
+    def __str__(self):
+        return self.nom
+
+
+class TypePaiementSalaire(models.TextChoices):
+    SALAIRE = "salaire", "Salaire"
+    AVANCE = "avance", "Avance sur salaire"
+    PRIME = "prime", "Prime"
+
+
+class PaiementSalaire(models.Model):
+    employe = models.ForeignKey(Employe, on_delete=models.PROTECT, related_name="paiements")
+    # Mois concerné (toujours le 1er du mois) : une avance du 12 octobre
+    # se déduit du salaire d'octobre.
+    mois = models.DateField()
+    type_paiement = models.CharField(max_length=10, choices=TypePaiementSalaire.choices)
+    montant = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))])
+    mode_paiement = models.CharField(max_length=20, default="especes")
+    date_paiement = models.DateField()
+    commentaire = models.CharField(max_length=255, blank=True)
+    utilisateur = models.ForeignKey(Utilisateur, on_delete=models.PROTECT)
+    date_heure = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-date_paiement", "-pk"]
+        indexes = [models.Index(fields=["date_paiement"]), models.Index(fields=["mois"])]
+
+    def __str__(self):
+        return f"{self.employe} - {self.type_paiement} {self.montant} F"

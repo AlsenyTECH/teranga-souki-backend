@@ -2,7 +2,7 @@
 #
 # Remplit la base avec un jeu de données de TEST réaliste : comptes de test,
 # catalogue de supérette, fournisseurs, clients, puis N jours d'activité
-# (réceptions, ventes, crédits, retours, annulations, prestations, dépenses,
+# (réceptions avec péremption, ventes, crédits, retours, annulations, dépenses,
 # sessions de caisse ouvertes et fermées).
 #
 # Chaque opération passe par les VRAIES vues de l'API (permissions, verrous,
@@ -39,7 +39,7 @@ from superette import views
 from superette.management.commands.nettoyer_test import MODELES
 from superette.models import (
     AjustementStock, Approvisionnement, Categorie, Client, Fournisseur, InstantaneDonneesTest, PaiementFournisseur, Produit,
-    RemboursementCredit, RetourAppro, RetourVente, Role, Service, SessionCaisse, TransactionCaisse, Utilisateur,
+    RemboursementCredit, RetourAppro, RetourVente, Role, SessionCaisse, TransactionCaisse, Utilisateur,
 )
 
 PREFIXE_COMPTE = "test_"
@@ -114,7 +114,16 @@ CLIENTS = [
     ("Pape Seck", "771000015", "Fann"),
 ]
 
-SERVICES = [("Déplumage poulet", 250), ("Découpe poulet", 200)]
+EMPLOYES = [
+    # nom, poste, salaire mensuel, téléphone
+    ("Moussa Diop", "Caissier", 80000, "780000011"),
+    ("Aïssatou Ndiaye", "Caissière", 80000, "780000012"),
+    ("Babacar Faye", "Aide rayon / livraisons", 60000, "780000013"),
+]
+
+# Durée de conservation (jours) des lots reçus, par catégorie : produits
+# frais et boissons ont une date de péremption, le reste non.
+CONSERVATION = {"Frais": (6, 25), "Boissons": (60, 240), "Épicerie": (120, 400)}
 
 DEPENSES_QUOTIDIENNES = [("Transport marchandises", 1500, 4000), ("Sachets et emballages", 500, 2000)]
 
@@ -154,7 +163,6 @@ class Command(BaseCommand):
         sans_limite = {"throttle_classes": []}
         return {
             "vente": views.VenteView.as_view(**sans_limite),
-            "prestation": views.PrestationView.as_view(**sans_limite),
             "appro": views.ApprovisionnementView.as_view(**sans_limite),
             "appro_detail": views.ApprovisionnementDetailView.as_view(**sans_limite),
             "retour_appro": views.RetourApproView.as_view(**sans_limite),
@@ -234,8 +242,10 @@ class Command(BaseCommand):
         }
         InstantaneDonneesTest.objects.create(donnees={
             "reperes": reperes,
-            "produits": {str(pk): {"quantite_stock": str(q), "prix_achat_moyen": str(c)}
-                         for pk, q, c in Produit.objects.values_list("pk", "quantite_stock", "prix_achat_moyen")},
+            "produits": {str(pk): {"quantite_stock": str(q), "prix_achat_moyen": str(c),
+                                   "date_peremption": d.isoformat() if d else None}
+                         for pk, q, c, d in Produit.objects.values_list(
+                             "pk", "quantite_stock", "prix_achat_moyen", "date_peremption")},
             "clients": {str(pk): {"solde_credit": str(s), "points_fidelite": pts}
                         for pk, s, pts in Client.objects.values_list("pk", "solde_credit", "points_fidelite")},
             "fournisseurs": {str(pk): {"solde_du": str(s)}
@@ -268,10 +278,15 @@ class Command(BaseCommand):
                 quantite = self.rng.choice([40, 60, 80]) if p.unite_vente == "unite" else self.rng.choice([25, 40, 50])
                 prix = arrondi(p.prix_achat_reference * D(self.rng.uniform(0.95, 1.05)), "1")
                 if p.unite_vente == "unite" and quantite % 20 == 0 and self.rng.random() < 0.4:
-                    lignes.append({"produit": p.id, "quantite_recue": quantite,
-                                   "prix_lot": str(prix * 20), "quantite_par_lot": 20})
+                    ligne = {"produit": p.id, "quantite_recue": quantite,
+                             "prix_lot": str(prix * 20), "quantite_par_lot": 20}
                 else:
-                    lignes.append({"produit": p.id, "quantite_recue": quantite, "prix_unitaire_achat": str(prix)})
+                    ligne = {"produit": p.id, "quantite_recue": quantite, "prix_unitaire_achat": str(prix)}
+                conservation = CONSERVATION.get(getattr(p.categorie, "libelle", ""))
+                if conservation:
+                    jours = self.rng.randint(*conservation)
+                    ligne["date_peremption"] = (self.jour_courant + timedelta(days=jours)).isoformat()
+                lignes.append(ligne)
             if initial:
                 mode, paye = "comptant", None
             else:
@@ -346,10 +361,11 @@ class Command(BaseCommand):
 
     # ------------------------------------------------------------ journée type
 
-    def journee(self, jour, comptes, produits, clients, fournisseurs, services, fermer=True):
+    def journee(self, jour, comptes, produits, clients, fournisseurs, fermer=True):
         admin = comptes["test_admin"]
         caissiers = [comptes["test_caissier1"], comptes["test_caissier2"]]
         reperes = self.reperes()
+        self.jour_courant = jour
 
         self.reapprovisionner(admin, produits, fournisseurs)
         self.appeler(self.v["ouvrir"], "post", admin, {"fond_ouverture": "0"})
@@ -361,13 +377,6 @@ class Command(BaseCommand):
                                     peut_remiser="remises" in caissier.permissions_supplementaires)
                 if vente:
                     ventes_du_jour.append(vente)
-            for _ in range(self.rng.randint(0, 3)):
-                client = self.rng.choice(clients) if self.rng.random() < 0.5 else None
-                donnees = {"service": self.rng.choice(services).id, "quantite": self.rng.randint(1, 6),
-                           "mode_paiement": self.rng.choice(["especes", "especes", "wave"])}
-                if client:
-                    donnees["client"] = client.id
-                self.appeler(self.v["prestation"], "post", caissier, donnees)
 
         # Retour client occasionnel, et annulation plus rare (par l'admin).
         if ventes_du_jour and self.rng.random() < 0.35:
@@ -407,8 +416,6 @@ class Command(BaseCommand):
             self.depense(admin, jour, "Loyer", 150000, "mensuelle")
         if jour.day == 5:
             self.depense(admin, jour, "Électricité Senelec", self.rng.randint(35000, 60000) // 100 * 100, "mensuelle")
-        if jour.weekday() == 5:
-            self.depense(admin, jour, "Salaire journalier aide", 5000, "hebdomadaire")
         # Cas plus rares, forcés à dates fixes pour être sûrs de les avoir.
         numero_jour = (jour - self.premier_jour).days
         if numero_jour == 4:
@@ -467,6 +474,57 @@ class Command(BaseCommand):
                 "commentaire": "Inventaire : stock réel inférieur au stock théorique",
             })
             produit.refresh_from_db()
+
+    def inventaire(self, admin, produits):
+        """Inventaire validé aujourd'hui sur 8 produits : la plupart justes,
+        quelques écarts (manquants, surplus) pour tester le rapport."""
+        from superette.models import Inventaire, LigneInventaire
+        from superette.serializers import valider_inventaire
+        inventaire = Inventaire.objects.create(libelle="Inventaire de test", utilisateur=admin)
+        for produit in self.rng.sample([p for p in produits if p.quantite_stock >= 5], k=8):
+            produit.refresh_from_db()
+            ecart = D(self.rng.choice([0, 0, 0, -1, -2, 1]))
+            if produit.unite_vente == "kg":
+                ecart = ecart / 2
+            LigneInventaire.objects.create(inventaire=inventaire, produit=produit,
+                                           quantite_comptee=max(D("0"), produit.quantite_stock + ecart))
+        valider_inventaire(inventaire, admin)
+        for p in produits:
+            p.refresh_from_db()
+
+    def peremptions(self, produits):
+        """Un produit frais déjà périmé et un autre qui expire dans 4 jours,
+        pour voir les alertes de péremption tout de suite."""
+        frais = [p for p in produits if getattr(p.categorie, "libelle", "") in CONSERVATION] or produits
+        aujourd_hui = timezone.localdate()
+        for produit, jours in zip(self.rng.sample(frais, k=min(2, len(frais))), (-3, 4)):
+            Produit.objects.filter(pk=produit.pk).update(date_peremption=aujourd_hui + timedelta(days=jours))
+
+    def salaires(self, admin, premier_jour, aujourd_hui, suffixe):
+        """Employés et salaires de chaque mois couvert : avance le 15, solde
+        en fin de mois (le mois en cours reste partiellement payé)."""
+        from calendar import monthrange
+        from superette.models import Employe, PaiementSalaire
+        employes = [Employe.objects.create(nom=n + suffixe, poste=p, salaire_mensuel=D(s), telephone=t,
+                                           date_embauche=premier_jour - timedelta(days=200))
+                    for n, p, s, t in EMPLOYES]
+        mois = premier_jour.replace(day=1)
+        while mois <= aujourd_hui:
+            fin = mois.replace(day=monthrange(mois.year, mois.month)[1])
+            for e in employes:
+                avance = arrondi(e.salaire_mensuel * D("0.3"), "1")
+                jour_avance = mois.replace(day=15)
+                if premier_jour <= jour_avance <= aujourd_hui and self.rng.random() < 0.7:
+                    PaiementSalaire.objects.create(employe=e, mois=mois, type_paiement="avance", montant=avance,
+                                                   mode_paiement="especes", date_paiement=jour_avance, utilisateur=admin)
+                else:
+                    avance = D("0")
+                if premier_jour <= fin < aujourd_hui:
+                    PaiementSalaire.objects.create(employe=e, mois=mois, type_paiement="salaire",
+                                                   montant=e.salaire_mensuel - avance,
+                                                   mode_paiement=self.rng.choice(["especes", "wave"]),
+                                                   date_paiement=fin, utilisateur=admin)
+            mois = (fin + timedelta(days=1))
 
     def depense(self, admin, jour, categorie, montant, recurrence):
         self.appeler(self.v["depense"], "post", admin, {
@@ -551,28 +609,30 @@ class Command(BaseCommand):
                     telephone=None if Client.objects.filter(telephone=t).exists() else t,
                 ) for n, t, a in CLIENTS
             ]
-            services = list(Service.objects.all()) if catalogue_existant else []
-            services = services or [Service.objects.create(libelle=l + suffixe, tarif=D(t)) for l, t in SERVICES]
 
             aujourd_hui = timezone.localdate()
             premier_jour = aujourd_hui - timedelta(days=jours)
             self.premier_jour = premier_jour
             reperes = self.reperes()
+            self.jour_courant = premier_jour - timedelta(days=1)
             self.reapprovisionner(comptes["test_admin"], produits, fournisseurs, initial=True)
             self.antidater(premier_jour - timedelta(days=1), reperes)
 
             for i in range(jours):
                 jour = premier_jour + timedelta(days=i)
-                self.journee(jour, comptes, produits, clients, fournisseurs, services)
+                self.journee(jour, comptes, produits, clients, fournisseurs)
                 self.stdout.write(f"  {jour.isoformat()} ok")
             # Aujourd'hui : caisses laissées OUVERTES, pour tester la fermeture et le rapport Z.
-            self.journee(aujourd_hui, comptes, produits, clients, fournisseurs, services, fermer=False)
+            self.journee(aujourd_hui, comptes, produits, clients, fournisseurs, fermer=False)
+            self.inventaire(comptes["test_admin"], produits)
             self.stocks_bas(comptes["test_admin"], produits)
+            self.peremptions(produits)
+            self.salaires(comptes["test_admin"], premier_jour, aujourd_hui, suffixe)
 
         self.stdout.write(self.style.SUCCESS(
             f"\nDonnées de test créées : {jours} jours d'historique + aujourd'hui (caisses ouvertes).\n"
             f"  {Produit.objects.count()} produits, {Client.objects.count()} clients, "
-            f"{Fournisseur.objects.count()} fournisseurs, {TransactionCaisse.objects.count()} ventes/prestations, "
+            f"{Fournisseur.objects.count()} fournisseurs, {TransactionCaisse.objects.count()} ventes, "
             f"{Approvisionnement.objects.count()} réceptions, {SessionCaisse.objects.count()} sessions de caisse.\n\n"
             f"Comptes de test (mot de passe commun : {mot_de_passe}) :\n"
             f"  test_admin      admin\n"

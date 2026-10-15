@@ -5,13 +5,15 @@ from rest_framework.routers import DefaultRouter
 from django.urls import path, include
 from .views import (
     CategorieViewSet, ProduitViewSet, ClientViewSet,
-    FournisseurViewSet, ServiceViewSet, ConnexionView, DeconnexionView, VenteView,
-    ApprovisionnementView, ApprovisionnementDetailView, RetourApproView, PrestationView, DepenseViewSet, RapportJournalierView,
+    FournisseurViewSet, ConnexionView, DeconnexionView, VenteView,
+    ApprovisionnementView, ApprovisionnementDetailView, RetourApproView, DepenseViewSet, RapportJournalierView,
     RapportPeriodeView, RoleViewSet, UtilisateurListCreateView,
     UtilisateurPermissionsView, UtilisateurDetailView, MonProfilView,
     AjustementStockView, AnnulerVenteView, RemboursementCreditView, PaiementFournisseurView,
     SessionCaisseOuvrirView, SessionCaisseCouranteView, SessionCaisseFermerView, SessionCaisseListView,
     RetourVenteView, ArchiverCreanceClientView, ArchiverCreanceFournisseurView,
+    InventaireListCreateView, InventaireDetailView, InventaireLigneView, InventaireValiderView,
+    EmployeViewSet, PaiementSalaireViewSet, ComptabiliteView, SauvegardeView,
 )
 
 # DefaultRouter génère automatiquement toutes les URLs REST standard
@@ -21,9 +23,10 @@ router.register("categories", CategorieViewSet)
 router.register("produits", ProduitViewSet)
 router.register("clients", ClientViewSet)
 router.register("fournisseurs", FournisseurViewSet)
-router.register("services", ServiceViewSet)
 router.register("depenses", DepenseViewSet)
 router.register("roles", RoleViewSet)
+router.register("employes", EmployeViewSet)
+router.register("paiements-salaire", PaiementSalaireViewSet)
 
 urlpatterns = [
     path("connexion/", ConnexionView.as_view(), name="connexion"),
@@ -34,7 +37,6 @@ urlpatterns = [
     path("approvisionnements/", ApprovisionnementView.as_view(), name="approvisionnements"),
     path("approvisionnements/<int:pk>/", ApprovisionnementDetailView.as_view(), name="approvisionnement-detail"),
     path("approvisionnements/<int:pk>/retour/", RetourApproView.as_view(), name="retour-appro"),
-    path("prestations/", PrestationView.as_view(), name="prestations"),
     path("rapports/", RapportJournalierView.as_view(), name="rapports"),
     path("rapports/periode/", RapportPeriodeView.as_view(), name="rapport-periode"),
     path("utilisateurs/", UtilisateurListCreateView.as_view(), name="utilisateurs"),
@@ -50,5 +52,12 @@ urlpatterns = [
     path("sessions-caisse/ouvrir/", SessionCaisseOuvrirView.as_view(), name="session-caisse-ouvrir"),
     path("sessions-caisse/courante/", SessionCaisseCouranteView.as_view(), name="session-caisse-courante"),
     path("sessions-caisse/<int:pk>/fermer/", SessionCaisseFermerView.as_view(), name="session-caisse-fermer"),
+    path("inventaires/", InventaireListCreateView.as_view(), name="inventaires"),
+    path("inventaires/<int:pk>/", InventaireDetailView.as_view(), name="inventaire-detail"),
+    path("inventaires/<int:pk>/lignes/", InventaireLigneView.as_view(), name="inventaire-lignes"),
+    path("inventaires/<int:pk>/lignes/<int:produit_id>/", InventaireLigneView.as_view(), name="inventaire-ligne"),
+    path("inventaires/<int:pk>/valider/", InventaireValiderView.as_view(), name="inventaire-valider"),
+    path("comptabilite/", ComptabiliteView.as_view(), name="comptabilite"),
+    path("sauvegarde/", SauvegardeView.as_view(), name="sauvegarde"),
     path("", include(router.urls)),
 ]

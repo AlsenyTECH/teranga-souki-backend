@@ -4,7 +4,7 @@
 from decimal import Decimal
 from rest_framework import serializers
 from .models import (
-    Role, Utilisateur, Categorie, Produit, Client, Fournisseur, Service, Depense,
+    Role, Utilisateur, Categorie, Produit, Client, Fournisseur, Depense,
 )
 
 
@@ -53,7 +53,7 @@ class ProduitSerializer(serializers.ModelSerializer):
             "id", "nom", "code_barre", "prix_achat_moyen", "prix_vente",
             "prix_vente_gros", "seuil_gros",
             "unite_vente", "quantite_stock", "seuil_alerte", "categorie", "categorie_nom",
-            "actif", "stock_bas",
+            "actif", "stock_bas", "date_peremption",
         ]
         # prix_achat_moyen n'est JAMAIS modifiable directement depuis l'API :
         # il est recalculé automatiquement par la logique métier des
@@ -116,12 +116,6 @@ class FournisseurSerializer(serializers.ModelSerializer):
         # Même règle que Client.solde_credit : jamais modifiable en
         # écriture directe, uniquement via les réceptions et paiements.
         read_only_fields = ["solde_du"]
-
-
-class ServiceSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Service
-        fields = ["id", "libelle", "tarif"]
 
 
 # ============================================================
@@ -663,6 +657,7 @@ class LigneApproEcritureSerializer(serializers.Serializer):
     prix_lot = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False)
     quantite_par_lot = serializers.DecimalField(max_digits=10, decimal_places=3, min_value=Decimal("0.001"), required=False)
     prix_vente = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False)
+    date_peremption = serializers.DateField(required=False, allow_null=True)
 
     def validate(self, data):
         achat_lot = data.get("prix_lot") is not None or data.get("quantite_par_lot") is not None
@@ -688,7 +683,7 @@ class LigneApproLectureSerializer(serializers.ModelSerializer):
         model = LigneAppro
         fields = [
             "id", "produit", "produit_nom", "produit_unite_vente", "quantite_recue", "prix_unitaire_achat",
-            "prix_lot", "quantite_par_lot", "quantite_retournee", "quantite_restante",
+            "prix_lot", "quantite_par_lot", "quantite_retournee", "quantite_restante", "date_peremption",
         ]
 
     def get_quantite_retournee(self, obj):
@@ -730,10 +725,12 @@ def _appliquer_ligne_appro(appro, ligne):
     valeur_totale = (stock_avant * prix_moyen_avant) + (quantite * prix_lot)
     nouveau_prix_moyen = (valeur_totale / nouveau_stock).quantize(Decimal("0.01"))
 
+    date_peremption = ligne.get("date_peremption")
     LigneAppro.objects.create(
         appro=appro, produit=produit,
         quantite_recue=quantite, prix_unitaire_achat=prix_lot,
         prix_lot=prix_lot_saisi, quantite_par_lot=quantite_par_lot,
+        date_peremption=date_peremption,
     )
 
     # Ici on assigne les valeurs déjà calculées en Python, pas via F()
@@ -746,6 +743,13 @@ def _appliquer_ligne_appro(appro, ligne):
     produit.quantite_stock = nouveau_stock
     produit.prix_achat_moyen = nouveau_prix_moyen
     champs_modifies = ["quantite_stock", "prix_achat_moyen"]
+
+    # Péremption : le produit garde la date du lot qui expire le plus tôt
+    # parmi ce qui est encore en rayon (rayon vide -> la date du nouveau lot).
+    if date_peremption is not None:
+        if stock_avant <= 0 or produit.date_peremption is None or date_peremption < produit.date_peremption:
+            produit.date_peremption = date_peremption
+            champs_modifies.append("date_peremption")
 
     prix_vente_saisi = ligne.get("prix_vente")
     if prix_vente_saisi is not None:
@@ -1092,89 +1096,6 @@ class ApprovisionnementLectureSerializer(serializers.ModelSerializer):
             "id", "date_reception", "fournisseur", "fournisseur_nom", "numero_facture", "lignes",
             "montant_total", "mode_paiement", "montant_paye", "annulee", "retours",
         ]
-
-
-# ============================================================
-# Chapitre 14 — Prestation de service (ex: déplumage de poulet)
-# Plus simple que la vente : pas de stock, juste service x quantité
-# ============================================================
-
-from .models import PrestationService
-
-
-class PrestationCreationSerializer(serializers.Serializer):
-    """
-    POST /api/prestations/
-    {
-      "client": 3,               // optionnel, comme pour la vente
-      "mode_paiement": "especes",
-      "service": 1,               // id du Service ("Déplumage poulet")
-      "quantite": 4                // ex: 4 poulets
-    }
-    """
-    client = serializers.PrimaryKeyRelatedField(
-        queryset=Client.objects.all(), required=False, allow_null=True
-    )
-    mode_paiement = serializers.ChoiceField(choices=["especes", "wave", "orange_money"])
-    service = serializers.PrimaryKeyRelatedField(queryset=Service.objects.all())
-    quantite = serializers.IntegerField(min_value=1, default=1)
-
-    def create(self, validated_data):
-        utilisateur = self.context["utilisateur"]
-        service = validated_data["service"]
-        quantite = validated_data["quantite"]
-        montant_total = service.tarif * quantite
-
-        # Moins de risque de concurrence ici (pas de stock partagé à
-        # verrouiller), mais on garde transaction.atomic() quand même :
-        # si la création de PrestationService échoue pour une raison
-        # quelconque après celle de TransactionCaisse, on ne veut pas
-        # une transaction "orpheline" sans son sous-type.
-        with transaction.atomic():
-            # Même règle que pour une vente : une prestation payée en
-            # espèces doit compter dans le rapport Z de la session en cours.
-            session = SessionCaisse.objects.filter(
-                utilisateur=utilisateur, statut=StatutSession.OUVERTE
-            ).first()
-            if session is None:
-                raise serializers.ValidationError(
-                    "Aucune session de caisse ouverte — ouvre la caisse avant d'enregistrer une prestation."
-                )
-
-            transaction_caisse = TransactionCaisse.objects.create(
-                montant_total=montant_total,
-                mode_paiement=validated_data["mode_paiement"],
-                utilisateur=utilisateur,
-                client=validated_data.get("client"),
-                session_caisse=session,
-            )
-            PrestationService.objects.create(
-                transaction=transaction_caisse, service=service, quantite=quantite,
-            )
-            return transaction_caisse
-
-
-class PrestationLectureSerializer(serializers.ModelSerializer):
-    caissier_nom = serializers.StringRelatedField(source="utilisateur", read_only=True)
-    client_nom = serializers.StringRelatedField(source="client", read_only=True)
-    client_telephone = serializers.SerializerMethodField()
-    client_adresse = serializers.SerializerMethodField()
-    service_nom = serializers.StringRelatedField(source="prestationservice.service", read_only=True)
-    quantite = serializers.IntegerField(source="prestationservice.quantite", read_only=True)
-
-    class Meta:
-        model = TransactionCaisse
-        fields = [
-            "id", "date_heure", "montant_total", "mode_paiement",
-            "caissier_nom", "client_nom", "client_telephone", "client_adresse",
-            "service_nom", "quantite", "annulee",
-        ]
-
-    def get_client_telephone(self, obj):
-        return obj.client.telephone if obj.client else None
-
-    def get_client_adresse(self, obj):
-        return obj.client.adresse if obj.client else None
 
 
 # ============================================================
@@ -1648,3 +1569,187 @@ class ArchiveCreanceFournisseurSerializer(serializers.ModelSerializer):
     class Meta:
         model = ArchiveCreanceFournisseur
         fields = ["id", "date_archivage", "total_recu_a_credit", "total_paye", "utilisateur_nom"]
+
+# ============================================================
+# Inventaire physique
+# ============================================================
+
+from .models import Inventaire, LigneInventaire, StatutInventaire, Employe, PaiementSalaire, TypePaiementSalaire
+
+
+class LigneInventaireLectureSerializer(serializers.ModelSerializer):
+    produit_nom = serializers.CharField(source="produit.nom", read_only=True)
+    produit_unite_vente = serializers.CharField(source="produit.unite_vente", read_only=True)
+    categorie_nom = serializers.CharField(source="produit.categorie.libelle", read_only=True)
+    stock_theorique = serializers.SerializerMethodField()
+    ecart = serializers.SerializerMethodField()
+    valeur_ecart = serializers.SerializerMethodField()
+
+    class Meta:
+        model = LigneInventaire
+        fields = [
+            "id", "produit", "produit_nom", "produit_unite_vente", "categorie_nom",
+            "quantite_comptee", "stock_theorique", "ecart", "valeur_ecart",
+        ]
+
+    # Inventaire en cours : comparé au stock ACTUEL (il bouge avec les ventes).
+    # Inventaire validé : valeurs figées au moment de la validation.
+    def _theorique(self, obj):
+        return obj.stock_theorique if obj.stock_theorique is not None else obj.produit.quantite_stock
+
+    def _cump(self, obj):
+        return obj.prix_achat_moyen if obj.prix_achat_moyen is not None else obj.produit.prix_achat_moyen
+
+    def get_stock_theorique(self, obj):
+        return self._theorique(obj)
+
+    def get_ecart(self, obj):
+        return obj.quantite_comptee - self._theorique(obj)
+
+    def get_valeur_ecart(self, obj):
+        return ((obj.quantite_comptee - self._theorique(obj)) * self._cump(obj)).quantize(Decimal("0.01"))
+
+
+class InventaireSerializer(serializers.ModelSerializer):
+    utilisateur_nom = serializers.StringRelatedField(source="utilisateur", read_only=True)
+    lignes = LigneInventaireLectureSerializer(many=True, read_only=True)
+    nb_lignes = serializers.SerializerMethodField()
+    nb_ecarts = serializers.SerializerMethodField()
+    valeur_ecarts = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Inventaire
+        fields = [
+            "id", "libelle", "statut", "utilisateur_nom", "date_creation", "date_validation", "commentaire",
+            "lignes", "nb_lignes", "nb_ecarts", "valeur_ecarts",
+        ]
+        read_only_fields = ["statut", "date_validation"]
+
+    def _lignes(self, obj):
+        return LigneInventaireLectureSerializer(obj.lignes.select_related("produit", "produit__categorie"), many=True).data
+
+    def get_nb_lignes(self, obj):
+        return obj.lignes.count()
+
+    def get_nb_ecarts(self, obj):
+        return sum(1 for l in self._lignes(obj) if Decimal(str(l["ecart"])) != 0)
+
+    def get_valeur_ecarts(self, obj):
+        return sum((Decimal(str(l["valeur_ecart"])) for l in self._lignes(obj)), Decimal("0"))
+
+
+class LigneInventaireEcritureSerializer(serializers.Serializer):
+    produit = serializers.PrimaryKeyRelatedField(queryset=Produit.objects.all())
+    quantite_comptee = serializers.DecimalField(max_digits=10, decimal_places=3, min_value=Decimal("0"))
+
+    def validate(self, data):
+        produit = data["produit"]
+        q = data["quantite_comptee"]
+        if produit.unite_vente == "unite" and q != q.to_integral_value():
+            raise serializers.ValidationError(f"{produit.nom} se vend à l'unité : la quantité comptée doit être entière.")
+        return data
+
+
+def valider_inventaire(inventaire, utilisateur):
+    """Transforme chaque écart compté en AjustementStock (motif comptage),
+    fige stock théorique et CUMP sur les lignes, puis clôt l'inventaire."""
+    from django.utils import timezone
+    with transaction.atomic():
+        inventaire = Inventaire.objects.select_for_update().get(pk=inventaire.pk)
+        if inventaire.statut != StatutInventaire.EN_COURS:
+            raise serializers.ValidationError("Cet inventaire est déjà validé.")
+        lignes = list(inventaire.lignes.select_related("produit").order_by("produit_id"))
+        if not lignes:
+            raise serializers.ValidationError("Aucun produit compté : saisis au moins une quantité avant de valider.")
+        for ligne in lignes:
+            produit = Produit.objects.select_for_update().get(pk=ligne.produit_id)
+            ligne.stock_theorique = produit.quantite_stock
+            ligne.prix_achat_moyen = produit.prix_achat_moyen
+            ligne.save(update_fields=["stock_theorique", "prix_achat_moyen"])
+            delta = ligne.quantite_comptee - produit.quantite_stock
+            if delta != 0:
+                AjustementStock.objects.create(
+                    produit=produit, delta=delta, motif=MotifAjustement.COMPTAGE,
+                    commentaire=f"Inventaire n°{inventaire.pk}", utilisateur=utilisateur, inventaire=inventaire,
+                )
+                produit.quantite_stock = ligne.quantite_comptee
+                produit.save(update_fields=["quantite_stock"])
+        inventaire.statut = StatutInventaire.VALIDE
+        inventaire.date_validation = timezone.now()
+        inventaire.save(update_fields=["statut", "date_validation"])
+        return inventaire
+
+
+# ============================================================
+# Employés et salaires
+# ============================================================
+
+def premier_du_mois(d):
+    return d.replace(day=1)
+
+
+class EmployeSerializer(serializers.ModelSerializer):
+    paye_mois_courant = serializers.SerializerMethodField()
+    reste_mois_courant = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Employe
+        fields = [
+            "id", "nom", "telephone", "poste", "salaire_mensuel", "date_embauche", "actif",
+            "paye_mois_courant", "reste_mois_courant",
+        ]
+
+    def _paye(self, obj):
+        from django.utils import timezone
+        mois = premier_du_mois(timezone.localdate())
+        return obj.paiements.filter(
+            mois=mois, type_paiement__in=[TypePaiementSalaire.SALAIRE, TypePaiementSalaire.AVANCE]
+        ).aggregate(total=Sum("montant"))["total"] or Decimal("0")
+
+    def get_paye_mois_courant(self, obj):
+        return self._paye(obj)
+
+    def get_reste_mois_courant(self, obj):
+        return max(Decimal("0"), obj.salaire_mensuel - self._paye(obj))
+
+
+class PaiementSalaireSerializer(serializers.ModelSerializer):
+    employe_nom = serializers.CharField(source="employe.nom", read_only=True)
+    employe_poste = serializers.CharField(source="employe.poste", read_only=True)
+    utilisateur_nom = serializers.StringRelatedField(source="utilisateur", read_only=True)
+
+    class Meta:
+        model = PaiementSalaire
+        fields = [
+            "id", "employe", "employe_nom", "employe_poste", "mois", "type_paiement", "montant",
+            "mode_paiement", "date_paiement", "commentaire", "utilisateur_nom", "date_heure",
+        ]
+        read_only_fields = ["utilisateur_nom", "date_heure"]
+
+    def validate_mode_paiement(self, value):
+        if value not in ("especes", "wave", "orange_money", "virement"):
+            raise serializers.ValidationError("Mode de paiement invalide.")
+        return value
+
+    def validate_mois(self, value):
+        return premier_du_mois(value)
+
+    def validate(self, data):
+        employe = data.get("employe") or getattr(self.instance, "employe", None)
+        type_paiement = data.get("type_paiement") or getattr(self.instance, "type_paiement", None)
+        if employe is not None and type_paiement in (TypePaiementSalaire.SALAIRE, TypePaiementSalaire.AVANCE):
+            mois = data.get("mois") or getattr(self.instance, "mois", None)
+            deja = employe.paiements.filter(
+                mois=mois, type_paiement__in=[TypePaiementSalaire.SALAIRE, TypePaiementSalaire.AVANCE]
+            )
+            if self.instance is not None:
+                deja = deja.exclude(pk=self.instance.pk)
+            deja = deja.aggregate(total=Sum("montant"))["total"] or Decimal("0")
+            reste = employe.salaire_mensuel - deja
+            if data["montant"] > reste:
+                raise serializers.ValidationError(
+                    f"Il ne reste que {reste:.0f} F à verser à {employe.nom} pour ce mois "
+                    f"(salaire {employe.salaire_mensuel:.0f} F, déjà versé {deja:.0f} F). "
+                    "Utilise « Prime » pour un montant en plus."
+                )
+        return data

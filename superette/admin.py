@@ -4,7 +4,7 @@
 from django.contrib import admin
 from .models import (
     Role, Utilisateur, Categorie, Produit, Client, Fournisseur,
-    Service, TransactionCaisse, VenteProduits, PrestationService,
+    TransactionCaisse, VenteProduits,
     LigneVente, Approvisionnement, LigneAppro, Depense,
 )
 
@@ -15,10 +15,8 @@ admin.site.register(Categorie)
 admin.site.register(Produit)
 admin.site.register(Client)
 admin.site.register(Fournisseur)
-admin.site.register(Service)
 admin.site.register(TransactionCaisse)
 admin.site.register(VenteProduits)
-admin.site.register(PrestationService)
 admin.site.register(LigneVente)
 admin.site.register(Approvisionnement)
 admin.site.register(LigneAppro)
