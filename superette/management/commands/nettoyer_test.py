@@ -27,8 +27,9 @@ from django.db import transaction
 from superette.models import (
     AjustementStock, Approvisionnement, ArchiveCreanceClient, ArchiveCreanceFournisseur, Categorie, Client,
     Depense, Fournisseur, InstantaneDonneesTest, LigneAppro, LigneRetour, LigneRetourAppro, LigneVente, PaiementFournisseur,
-    PaiementVente, PrestationService, Produit, RemboursementCredit, RetourAppro, RetourVente, Service,
+    PaiementVente, Produit, RemboursementCredit, RetourAppro, RetourVente,
     SessionCaisse, TransactionCaisse, Utilisateur, VenteProduits,
+    Inventaire, LigneInventaire, Employe, PaiementSalaire,
 )
 
 PREFIXE_COMPTE = "test_"
@@ -37,17 +38,17 @@ PREFIXE_COMPTE = "test_"
 # (les clés étrangères sont en PROTECT, l'ordre compte).
 MODELES = [
     LigneRetour, RetourVente, LigneRetourAppro, RetourAppro,
-    PaiementVente, LigneVente, VenteProduits, PrestationService, TransactionCaisse,
+    PaiementVente, LigneVente, VenteProduits, TransactionCaisse,
     LigneAppro, Approvisionnement,
     RemboursementCredit, PaiementFournisseur, ArchiveCreanceClient, ArchiveCreanceFournisseur,
-    AjustementStock, Depense, SessionCaisse,
-    Produit, Categorie, Service, Client, Fournisseur,
+    AjustementStock, LigneInventaire, Inventaire, PaiementSalaire, Employe, Depense, SessionCaisse,
+    Produit, Categorie, Client, Fournisseur,
 ]
 
 # Modèles portant un utilisateur : sert au garde-fou "données réelles".
 AVEC_UTILISATEUR = [
     TransactionCaisse, RetourVente, RetourAppro, SessionCaisse, AjustementStock, RemboursementCredit,
-    PaiementFournisseur, Depense, ArchiveCreanceClient, ArchiveCreanceFournisseur,
+    PaiementFournisseur, Depense, ArchiveCreanceClient, ArchiveCreanceFournisseur, Inventaire, PaiementSalaire,
 ]
 
 
@@ -126,7 +127,11 @@ class Command(BaseCommand):
                 # Produit ajouté pendant les tests : on le garde, sans stock.
                 produit.quantite_stock = Decimal(etat["quantite_stock"]) if etat else Decimal("0")
                 produit.prix_achat_moyen = Decimal(etat["prix_achat_moyen"]) if etat else Decimal("0")
-                produit.save(update_fields=["quantite_stock", "prix_achat_moyen"])
+                champs = ["quantite_stock", "prix_achat_moyen"]
+                if etat and "date_peremption" in etat:
+                    produit.date_peremption = etat["date_peremption"]
+                    champs.append("date_peremption")
+                produit.save(update_fields=champs)
             for pk, etat in donnees["clients"].items():
                 Client.objects.filter(pk=pk).update(
                     solde_credit=Decimal(etat["solde_credit"]), points_fidelite=etat["points_fidelite"])

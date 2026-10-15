@@ -22,7 +22,7 @@ from django.contrib.auth.hashers import make_password
 from django.utils import timezone
 
 from superette.models import (
-    Role, Utilisateur, Categorie, Produit, Client, Fournisseur, Service,
+    Role, Utilisateur, Categorie, Produit, Client, Fournisseur,
     TransactionCaisse, VenteProduits, LigneVente, Approvisionnement, LigneAppro,
     Depense,
 )
@@ -116,9 +116,6 @@ class Command(BaseCommand):
         ]:
             c, _ = Client.objects.get_or_create(nom=nom, defaults={"telephone": tel, "points_fidelite": random.randint(0, 50)})
             clients.append(c)
-
-        self.stdout.write("Service de déplumage...")
-        Service.objects.get_or_create(libelle="Déplumage de poulet", defaults={"tarif": Decimal("500")})
 
         self.stdout.write("Dépenses...")
         for montant, categorie, recurrence in [

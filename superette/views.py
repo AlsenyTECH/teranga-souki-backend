@@ -14,18 +14,17 @@ from django.db.models.functions import Coalesce
 from rest_framework.permissions import IsAuthenticated
 
 from .models import (
-    Categorie, Produit, Client, Fournisseur, Service, TransactionCaisse, Approvisionnement,
+    Categorie, Produit, Client, Fournisseur, TransactionCaisse, Approvisionnement,
     Depense, Role, Utilisateur, RemboursementCredit, PaiementFournisseur,
     SessionCaisse, StatutSession,
 )
 from .serializers import (
     CategorieSerializer, ProduitSerializer, ClientSerializer,
-    FournisseurSerializer, ServiceSerializer,
+    FournisseurSerializer,
     VenteCreationSerializer, TransactionCaisseLectureSerializer,
     ApprovisionnementCreationSerializer, ApprovisionnementLectureSerializer,
     ApprovisionnementModificationSerializer, verifier_appro_modifiable, inverser_effet_appro,
     RetourApproCreationSerializer,
-    PrestationCreationSerializer, PrestationLectureSerializer,
     DepenseSerializer, RoleSerializer, UtilisateurSerializer, UtilisateurCreationSerializer,
     AjustementStockCreationSerializer, AjustementStockLectureSerializer,
     RemboursementCreditSerializer, RemboursementCreditLectureSerializer,
@@ -134,12 +133,6 @@ class FournisseurViewSet(SuppressionProtegeeMixin, viewsets.ModelViewSet):
     queryset = Fournisseur.objects.all()
     serializer_class = FournisseurSerializer
     permission_classes = [PeutGererFournisseurs]
-
-
-class ServiceViewSet(SuppressionProtegeeMixin, viewsets.ModelViewSet):
-    queryset = Service.objects.all()
-    serializer_class = ServiceSerializer
-    permission_classes = [LectureAdminEcritureAdmin]
 
 
 class VenteView(APIView):
@@ -281,33 +274,6 @@ class RetourApproView(APIView):
         return Response(out.data, status=status.HTTP_201_CREATED)
 
 
-class PrestationView(APIView):
-    """
-    POST /api/prestations/ — enregistre une prestation de service
-    (déplumage de poulet, ou tout autre service futur du catalogue).
-    """
-    permission_classes = [EstCaissierOuAdmin]
-
-    def post(self, request):
-        serializer = PrestationCreationSerializer(
-            data=request.data,
-            context={"utilisateur": request.user.utilisateur},
-        )
-        serializer.is_valid(raise_exception=True)
-        transaction_caisse = serializer.save()
-        out = PrestationLectureSerializer(transaction_caisse)
-        return Response(out.data, status=status.HTTP_201_CREATED)
-
-    def get(self, request):
-        qs = TransactionCaisse.objects.filter(
-            prestationservice__isnull=False
-        ).select_related("utilisateur", "client", "prestationservice__service").order_by("-date_heure")
-        if request.user.utilisateur.role_id != "admin":
-            qs = qs.filter(utilisateur=request.user.utilisateur)
-        qs = filtrer_par_dates(qs, request, "date_heure")
-        return reponse_liste(request, self, qs, PrestationLectureSerializer)
-
-
 class DepenseViewSet(SuppressionProtegeeMixin, viewsets.ModelViewSet):
     queryset = Depense.objects.select_related("utilisateur").all()
     serializer_class = DepenseSerializer
@@ -369,16 +335,14 @@ def calculer_totaux_periode(debut, fin):
     - Marge = Σ (prix - CUMP actuel) x quantité, moins les réductions
       accordées, moins la marge rendue par les retours. Approximation
       assumée : CUMP actuel, pas celui du jour de la vente (non historisé).
-    - Résultat net = marge + prestations - dépenses.
+    - Résultat net = marge - dépenses - salaires.
     """
     transactions = TransactionCaisse.objects.filter(
         date_heure__date__gte=debut, date_heure__date__lte=fin, annulee=False
     )
     ventes_qs = transactions.filter(venteproduits__isnull=False)
-    prestations_qs = transactions.filter(prestationservice__isnull=False)
 
     ca_ventes_brut = ventes_qs.aggregate(total=Coalesce(Sum("montant_total"), 0, output_field=DecimalField()))["total"]
-    ca_prestations = prestations_qs.aggregate(total=Coalesce(Sum("montant_total"), 0, output_field=DecimalField()))["total"]
 
     retours_qs = RetourVente.objects.filter(
         date_heure__date__gte=debut, date_heure__date__lte=fin, vente__annulee=False
@@ -413,23 +377,28 @@ def calculer_totaux_periode(debut, fin):
         date_depense__gte=debut, date_depense__lte=fin
     ).aggregate(total=Coalesce(Sum("montant"), 0, output_field=DecimalField()))["total"]
 
-    chiffre_affaires_total = ca_ventes + ca_prestations
+    # Salaires versés sur la période (salaire, avances et primes) : une
+    # charge au même titre que les dépenses.
+    from .models import PaiementSalaire
+    total_salaires = PaiementSalaire.objects.filter(
+        date_paiement__gte=debut, date_paiement__lte=fin
+    ).aggregate(total=Coalesce(Sum("montant"), 0, output_field=DecimalField()))["total"]
+
+    chiffre_affaires_total = ca_ventes
     deux = Decimal("0.01")
     return {
         "transactions": transactions,
         "ventes_qs": ventes_qs,
         "chiffre_affaires_ventes": Decimal(ca_ventes).quantize(deux),
-        "chiffre_affaires_prestations": Decimal(ca_prestations).quantize(deux),
         "chiffre_affaires_total": Decimal(chiffre_affaires_total).quantize(deux),
         "retours_ventes": Decimal(total_retours).quantize(deux),
         "reductions_accordees": Decimal(total_reductions).quantize(deux),
         "marge_brute_ventes": Decimal(marge).quantize(deux),
         "total_depenses": Decimal(total_depenses).quantize(deux),
+        "total_salaires": Decimal(total_salaires).quantize(deux),
         # Bénéfice réel : ce qu'il reste une fois payées les marchandises
-        # vendues (marge) ET les charges (dépenses). Les prestations n'ont pas
-        # de coût d'achat, elles comptent en entier. Avant : CA - dépenses,
-        # qui oubliait le coût des marchandises et gonflait le résultat.
-        "resultat_net": Decimal(marge + ca_prestations - total_depenses).quantize(deux),
+        # vendues (marge), les charges (dépenses) et les salaires.
+        "resultat_net": Decimal(marge - total_depenses - total_salaires).quantize(deux),
     }
 
 
@@ -834,7 +803,7 @@ class AjustementStockView(APIView):
 
 class AnnulerVenteView(APIView):
     """
-    POST /api/ventes/<id>/annuler/ — annule une vente ou une prestation et
+    POST /api/ventes/<id>/annuler/ — annule une vente et
     défait TOUS ses effets encore en place :
     - stock : on ne remet que la quantité pas déjà rendue par un retour ;
     - crédit client : on retire la part à crédit pas déjà déduite par un retour ;
@@ -1245,3 +1214,265 @@ class ConnexionView(ObtainAuthToken):
             "role": utilisateur.role_id if utilisateur else None,
             "permissions_supplementaires": utilisateur.permissions_supplementaires if utilisateur else [],
         })
+
+
+# ============================================================
+# Inventaire physique
+# ============================================================
+
+from .models import Inventaire, LigneInventaire, StatutInventaire, Employe, PaiementSalaire
+from .serializers import (
+    InventaireSerializer, LigneInventaireEcritureSerializer, valider_inventaire,
+    EmployeSerializer, PaiementSalaireSerializer,
+)
+
+
+class InventaireListCreateView(APIView):
+    """GET : historique des inventaires. POST : démarre un inventaire
+    (un seul en cours à la fois)."""
+    permission_classes = [EstAdmin]
+
+    def get(self, request):
+        qs = Inventaire.objects.select_related("utilisateur").prefetch_related("lignes")
+        return Response(InventaireSerializer(qs, many=True).data)
+
+    def post(self, request):
+        if Inventaire.objects.filter(statut=StatutInventaire.EN_COURS).exists():
+            return Response({"detail": "Un inventaire est déjà en cours : termine-le ou abandonne-le d'abord."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        serializer = InventaireSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        inventaire = serializer.save(utilisateur=request.user.utilisateur)
+        return Response(InventaireSerializer(inventaire).data, status=status.HTTP_201_CREATED)
+
+
+class InventaireDetailView(APIView):
+    """GET : détail avec écarts. DELETE : abandonne un inventaire en cours
+    (aucun effet sur le stock)."""
+    permission_classes = [EstAdmin]
+
+    def get(self, request, pk):
+        return Response(InventaireSerializer(get_object_or_404(Inventaire, pk=pk)).data)
+
+    def delete(self, request, pk):
+        inventaire = get_object_or_404(Inventaire, pk=pk)
+        if inventaire.statut != StatutInventaire.EN_COURS:
+            return Response({"detail": "Un inventaire validé ne peut plus être supprimé (traçabilité)."},
+                            status=status.HTTP_400_BAD_REQUEST)
+        inventaire.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class InventaireLigneView(APIView):
+    """POST : enregistre (ou corrige) la quantité comptée d'un produit.
+    DELETE /<produit_id>/ : retire un produit du comptage."""
+    permission_classes = [EstAdmin]
+
+    def _en_cours(self, pk):
+        inventaire = get_object_or_404(Inventaire, pk=pk)
+        if inventaire.statut != StatutInventaire.EN_COURS:
+            raise ValidationError({"detail": "Cet inventaire est déjà validé."})
+        return inventaire
+
+    def post(self, request, pk):
+        inventaire = self._en_cours(pk)
+        serializer = LigneInventaireEcritureSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        LigneInventaire.objects.update_or_create(
+            inventaire=inventaire, produit=serializer.validated_data["produit"],
+            defaults={"quantite_comptee": serializer.validated_data["quantite_comptee"]},
+        )
+        return Response(InventaireSerializer(inventaire).data)
+
+    def delete(self, request, pk, produit_id):
+        inventaire = self._en_cours(pk)
+        LigneInventaire.objects.filter(inventaire=inventaire, produit_id=produit_id).delete()
+        return Response(InventaireSerializer(inventaire).data)
+
+
+class InventaireValiderView(APIView):
+    """POST : applique les écarts au stock (ajustements « comptage »)."""
+    permission_classes = [EstAdmin]
+
+    def post(self, request, pk):
+        inventaire = valider_inventaire(get_object_or_404(Inventaire, pk=pk), request.user.utilisateur)
+        return Response(InventaireSerializer(inventaire).data)
+
+
+# ============================================================
+# Employés et salaires (admin uniquement : données sensibles)
+# ============================================================
+
+class EmployeViewSet(SuppressionProtegeeMixin, viewsets.ModelViewSet):
+    queryset = Employe.objects.all()
+    serializer_class = EmployeSerializer
+    permission_classes = [EstAdmin]
+
+
+class PaiementSalaireViewSet(SuppressionProtegeeMixin, viewsets.ModelViewSet):
+    serializer_class = PaiementSalaireSerializer
+    permission_classes = [EstAdmin]
+    queryset = PaiementSalaire.objects.select_related("employe", "utilisateur").all()
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        p = self.request.query_params
+        if p.get("employe"):
+            qs = qs.filter(employe_id=p["employe"])
+        if p.get("mois"):
+            qs = qs.filter(mois=parse_date(p["mois"] + "-01" if len(p["mois"]) == 7 else p["mois"], "mois").replace(day=1))
+        if p.get("date_debut"):
+            qs = qs.filter(date_paiement__gte=parse_date(p["date_debut"], "date_debut"))
+        if p.get("date_fin"):
+            qs = qs.filter(date_paiement__lte=parse_date(p["date_fin"], "date_fin"))
+        return qs
+
+    def perform_create(self, serializer):
+        serializer.save(utilisateur=self.request.user.utilisateur)
+
+
+# ============================================================
+# Comptabilité de gestion : compte de résultat mensuel, trésorerie
+# (encaissements / décaissements par mode) et situation à date.
+# ============================================================
+
+from calendar import monthrange
+from .models import (
+    Approvisionnement as ApproModel, PaiementFournisseur as PaiementFournisseurModel,
+    RemboursementCredit as RemboursementModel, PaiementVente, Client as ClientModel,
+    Fournisseur as FournisseurModel, Produit as ProduitModel, RetourVente as RetourVenteModel,
+)
+
+
+def _somme(qs, champ="montant"):
+    return qs.aggregate(total=Coalesce(Sum(champ), 0, output_field=DecimalField()))["total"]
+
+
+def _q(v):
+    return Decimal(v).quantize(Decimal("0.01"))
+
+
+def tresorerie_periode(debut, fin):
+    ventes = TransactionCaisse.objects.filter(
+        date_heure__date__gte=debut, date_heure__date__lte=fin, annulee=False, venteproduits__isnull=False
+    )
+    encaissements = {}
+    for mode in ("especes", "wave", "orange_money"):
+        direct = _somme(ventes.filter(mode_paiement=mode), "montant_total")
+        mixte = _somme(PaiementVente.objects.filter(vente__in=ventes.filter(mode_paiement="mixte"), mode_paiement=mode))
+        rembourse = _somme(RemboursementModel.objects.filter(
+            date_heure__date__gte=debut, date_heure__date__lte=fin, mode_paiement=mode))
+        encaissements[mode] = _q(direct + mixte + rembourse)
+    ventes_a_credit = _somme(ventes.filter(mode_paiement="credit"), "montant_total") + _somme(
+        PaiementVente.objects.filter(vente__in=ventes.filter(mode_paiement="mixte"), mode_paiement="credit"))
+
+    appros = ApproModel.objects.filter(date_reception__date__gte=debut, date_reception__date__lte=fin, annulee=False)
+    achats = _somme(appros, "montant_paye") + _somme(PaiementFournisseurModel.objects.filter(
+        date_heure__date__gte=debut, date_heure__date__lte=fin))
+    retours = _somme(RetourVenteModel.objects.filter(
+        date_heure__date__gte=debut, date_heure__date__lte=fin, affecte_caisse=True), "montant_total")
+    depenses = _somme(DepenseModel.objects.filter(date_depense__gte=debut, date_depense__lte=fin))
+    salaires = _somme(PaiementSalaire.objects.filter(date_paiement__gte=debut, date_paiement__lte=fin))
+    decaissements = {
+        "fournisseurs": _q(achats), "depenses": _q(depenses), "salaires": _q(salaires), "retours_clients": _q(retours),
+    }
+    total_in = sum(encaissements.values(), Decimal("0"))
+    total_out = sum(decaissements.values(), Decimal("0"))
+    return {
+        "encaissements": encaissements,
+        "total_encaissements": _q(total_in),
+        "ventes_a_credit": _q(ventes_a_credit),
+        "decaissements": decaissements,
+        "total_decaissements": _q(total_out),
+        "solde": _q(total_in - total_out),
+    }
+
+
+class ComptabiliteView(APIView):
+    """
+    GET /api/comptabilite/?annee=2026 — tableau de bord comptable de l'année :
+    compte de résultat mois par mois, dépenses par catégorie, trésorerie et
+    situation à date (stock valorisé, créances, dettes).
+    """
+    permission_classes = [EstAdmin]
+
+    def get(self, request):
+        aujourd_hui = timezone.localdate()
+        try:
+            annee = int(request.query_params.get("annee", aujourd_hui.year))
+        except ValueError:
+            raise ValidationError({"annee": "Année invalide."})
+        mois = []
+        for m in range(1, 13):
+            debut = date_cls(annee, m, 1)
+            if debut > aujourd_hui:
+                break
+            fin = date_cls(annee, m, monthrange(annee, m)[1])
+            t = calculer_totaux_periode(debut, fin)
+            ca = t["chiffre_affaires_ventes"]
+            mois.append({
+                "mois": f"{annee}-{m:02d}",
+                "chiffre_affaires": ca,
+                "cout_marchandises": _q(ca - t["marge_brute_ventes"]),
+                "marge_brute": t["marge_brute_ventes"],
+                "depenses": t["total_depenses"],
+                "salaires": t["total_salaires"],
+                "resultat_net": t["resultat_net"],
+                "nb_ventes": t["ventes_qs"].count(),
+            })
+        cles = ["chiffre_affaires", "cout_marchandises", "marge_brute", "depenses", "salaires", "resultat_net", "nb_ventes"]
+        total = {c: sum((m[c] for m in mois), Decimal("0") if c != "nb_ventes" else 0) for c in cles}
+        debut_annee, fin_annee = date_cls(annee, 1, 1), date_cls(annee, 12, 31)
+        par_categorie = (
+            DepenseModel.objects.filter(date_depense__gte=debut_annee, date_depense__lte=fin_annee)
+            .values("categorie").annotate(montant=Sum("montant")).order_by("-montant")
+        )
+        valeur_stock = sum(
+            (p.quantite_stock * p.prix_achat_moyen for p in ProduitModel.objects.filter(quantite_stock__gt=0)),
+            Decimal("0"),
+        )
+        return Response({
+            "annee": annee,
+            "mois": mois,
+            "total": total,
+            "depenses_par_categorie": [{"categorie": d["categorie"], "montant": _q(d["montant"])} for d in par_categorie],
+            "tresorerie": tresorerie_periode(debut_annee, min(fin_annee, aujourd_hui)),
+            "situation": {
+                "date": aujourd_hui,
+                "valeur_stock": _q(valeur_stock),
+                "creances_clients": _q(_somme(ClientModel.objects.filter(solde_credit__gt=0), "solde_credit")),
+                "dettes_fournisseurs": _q(_somme(FournisseurModel.objects.filter(solde_du__gt=0), "solde_du")),
+            },
+        })
+
+
+# ============================================================
+# Sauvegarde : export complet de la base (JSON compressé), à
+# télécharger depuis l'app et à garder sur un PC / Google Drive.
+# Restauration : python manage.py loaddata fichier.json.gz
+# ============================================================
+
+import gzip
+import io
+from django.core.management import call_command
+from django.http import HttpResponse
+
+EXCLUSIONS_SAUVEGARDE = ["contenttypes", "auth.permission", "admin.logentry", "sessions", "authtoken"]
+
+
+def contenu_sauvegarde():
+    tampon = io.StringIO()
+    call_command("dumpdata", "--natural-foreign", "--natural-primary",
+                 *[f"--exclude={e}" for e in EXCLUSIONS_SAUVEGARDE], stdout=tampon)
+    return gzip.compress(tampon.getvalue().encode("utf-8"))
+
+
+class SauvegardeView(APIView):
+    permission_classes = [EstAdmin]
+
+    def get(self, request):
+        nom = f"teranga-souki-{timezone.localtime():%Y%m%d-%H%M}.json.gz"
+        reponse = HttpResponse(contenu_sauvegarde(), content_type="application/gzip")
+        reponse["Content-Disposition"] = f'attachment; filename="{nom}"'
+        reponse["Access-Control-Expose-Headers"] = "Content-Disposition"
+        return reponse
