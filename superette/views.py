@@ -798,7 +798,8 @@ class AjustementStockView(APIView):
 
     def get(self, request):
         qs = AjustementStock.objects.select_related("produit", "utilisateur").order_by("-date_heure")
-        return Response(AjustementStockLectureSerializer(qs, many=True).data)
+        qs = filtrer_par_dates(qs, request, "date_heure")
+        return reponse_liste(request, self, qs, AjustementStockLectureSerializer)
 
 
 class AnnulerVenteView(APIView):

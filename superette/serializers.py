@@ -687,7 +687,9 @@ class LigneApproLectureSerializer(serializers.ModelSerializer):
         ]
 
     def get_quantite_retournee(self, obj):
-        return obj.retours.aggregate(total=Sum("quantite"))["total"] or Decimal("0")
+        # Somme Python sur .all() : profite du prefetch_related de la vue
+        # (avant : une requête SQL par ligne, 150 requêtes pour la liste).
+        return sum((r.quantite for r in obj.retours.all()), Decimal("0"))
 
     def get_quantite_restante(self, obj):
         return obj.quantite_recue - self.get_quantite_retournee(obj)
