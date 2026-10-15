@@ -43,6 +43,10 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # Compresse les réponses JSON (listes de ventes : ~500 Ko -> ~50 Ko),
+    # décisif sur une connexion 3G/4G. Placé en premier : il agit en dernier
+    # sur la réponse, après tous les autres.
+    'django.middleware.gzip.GZipMiddleware',
     'corsheaders.middleware.CorsMiddleware',       # doit être avant CommonMiddleware
     'django.middleware.security.SecurityMiddleware',
     # whitenoise sert les fichiers statiques (CSS/JS de l'admin Django)
