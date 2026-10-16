@@ -505,9 +505,17 @@ class Command(BaseCommand):
         en fin de mois (le mois en cours reste partiellement payé)."""
         from calendar import monthrange
         from superette.models import Employe, PaiementSalaire
-        employes = [Employe.objects.create(nom=n + suffixe, poste=p, salaire_mensuel=D(s), telephone=t,
-                                           date_embauche=premier_jour - timedelta(days=200))
-                    for n, p, s, t in EMPLOYES]
+        # Les deux caissiers de test ont leur fiche de paie liée à leur compte ;
+        # le troisième employé (aide rayon) n'utilise pas l'app.
+        comptes = list(Utilisateur.objects.filter(compte__username__in=["test_caissier1", "test_caissier2"])
+                       .order_by("compte__username"))
+        employes = []
+        for i, (n, p, s, t) in enumerate(EMPLOYES):
+            compte = comptes[i] if i < len(comptes) else None
+            employes.append(Employe.objects.create(
+                utilisateur=compte, nom=compte.nom if compte else n + suffixe, poste=p, salaire_mensuel=D(s),
+                telephone=compte.telephone if compte else t, date_embauche=premier_jour - timedelta(days=200),
+            ))
         mois = premier_jour.replace(day=1)
         while mois <= aujourd_hui:
             fin = mois.replace(day=monthrange(mois.year, mois.month)[1])

@@ -701,6 +701,28 @@ class SalaireTests(BaseTest):
         self.assertEqual(self.api_caissier.get("/api/employes/").status_code, 403)
         self.assertEqual(self.api_caissier.get("/api/paiements-salaire/").status_code, 403)
 
+    def test_fiche_de_paie_liee_a_un_compte(self):
+        r = self.api_admin.post("/api/employes/", {"utilisateur": self.caissier.id, "salaire_mensuel": "75000",
+                                                   "poste": "Caissier"}, format="json")
+        self.assertEqual(r.status_code, 201, r.data)
+        self.assertEqual(r.data["nom"], self.caissier.nom)  # repris du compte
+        self.assertEqual(r.data["telephone"], self.caissier.telephone)
+        self.assertEqual(r.data["utilisateur_username"], "caissier")
+        # un compte = une seule fiche de paie
+        r2 = self.api_admin.post("/api/employes/", {"utilisateur": self.caissier.id, "salaire_mensuel": "1"},
+                                 format="json")
+        self.assertEqual(r2.status_code, 400)
+        # la liste des utilisateurs affiche le salaire
+        u = next(u for u in self.api_admin.get("/api/utilisateurs/").data if u["id"] == self.caissier.id)
+        self.assertEqual(u["employe_id"], r.data["id"])
+        self.assertEqual(D(str(u["salaire_mensuel"])), D("75000"))
+        admin = next(u for u in self.api_admin.get("/api/utilisateurs/").data if u["id"] == self.admin.id)
+        self.assertIsNone(admin["employe_id"])
+
+    def test_employe_sans_compte_exige_un_nom(self):
+        r = self.api_admin.post("/api/employes/", {"salaire_mensuel": "50000"}, format="json")
+        self.assertEqual(r.status_code, 400)
+
     def test_employe_paye_non_supprimable(self):
         self.payer("1000", "avance")
         self.assertEqual(self.api_admin.delete(f"/api/employes/{self.employe.id}/").status_code, 400)

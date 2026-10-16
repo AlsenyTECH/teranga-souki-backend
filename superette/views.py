@@ -623,7 +623,7 @@ class UtilisateurListCreateView(APIView):
     permission_classes = [EstAdmin]
 
     def get(self, request):
-        qs = Utilisateur.objects.select_related("compte", "role").all()
+        qs = Utilisateur.objects.select_related("compte", "role", "employe").all()
         return Response(UtilisateurSerializer(qs, many=True).data)
 
     def post(self, request):
@@ -1305,7 +1305,7 @@ class InventaireValiderView(APIView):
 # ============================================================
 
 class EmployeViewSet(SuppressionProtegeeMixin, viewsets.ModelViewSet):
-    queryset = Employe.objects.all()
+    queryset = Employe.objects.select_related("utilisateur__compte").all()
     serializer_class = EmployeSerializer
     permission_classes = [EstAdmin]
 
