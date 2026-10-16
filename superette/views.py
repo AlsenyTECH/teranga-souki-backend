@@ -669,14 +669,11 @@ class UtilisateurDetailView(APIView):
         except Utilisateur.DoesNotExist:
             return Response({"detail": "Compte introuvable."}, status=status.HTTP_404_NOT_FOUND)
 
-        # Le compte du patron principal ne se modifie que par lui-même (via
-        # /mon-profil/) : sinon n'importe quel autre admin pourrait changer
-        # son mot de passe ou son identifiant et lui prendre la superette.
-        if utilisateur.est_compte_principal and utilisateur.compte_id != request.user.id:
-            return Response(
-                {"detail": "Le compte du patron principal ne peut être modifié que par lui-même."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
+        # Tout admin peut corriger les identifiants de n'importe quel compte,
+        # y compris celui du patron principal (choix du gérant : les admins
+        # se dépannent entre eux en cas de mot de passe oublié). Le compte
+        # principal reste insupprimable (voir delete()). Les sessions ouvertes
+        # du compte modifié sont coupées dès que son mot de passe change.
 
         serializer = UtilisateurEditionSerializer(instance=utilisateur, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)

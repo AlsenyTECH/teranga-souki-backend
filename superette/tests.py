@@ -512,11 +512,23 @@ class ComptesTests(BaseTest):
         super().setUp()
         self.patron = self.creer_utilisateur("patron", "admin", "700000003", est_compte_principal=True)
 
-    def test_autre_admin_ne_peut_pas_modifier_le_patron(self):
-        r = self.api_admin.patch(f"/api/utilisateurs/{self.patron.id}/", {"nouveau_mot_de_passe": "Pirate-2026-xyz"}, format="json")
-        self.assertEqual(r.status_code, 403)
+    def test_un_admin_peut_reinitialiser_le_compte_du_patron(self):
+        Token.objects.create(user=self.patron.compte)
+        r = self.api_admin.patch(f"/api/utilisateurs/{self.patron.id}/",
+                                 {"username": "souki", "nouveau_mot_de_passe": "Souki-Nouveau-2026"}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
         self.patron.compte.refresh_from_db()
-        self.assertTrue(self.patron.compte.check_password("MotDePasse-Solide-42"))
+        self.assertEqual(self.patron.compte.username, "souki")
+        self.assertTrue(self.patron.compte.check_password("Souki-Nouveau-2026"))
+        self.assertFalse(Token.objects.filter(user=self.patron.compte).exists())  # sessions coupées
+        # connexion avec les nouveaux identifiants
+        r = APIClient().post("/api/connexion/", {"username": "souki", "password": "Souki-Nouveau-2026"}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        # toujours insupprimable, et un caissier ne peut rien modifier
+        self.assertEqual(self.api_admin.delete(f"/api/utilisateurs/{self.patron.id}/").status_code, 400)
+        r = self.api_caissier.patch(f"/api/utilisateurs/{self.patron.id}/", {"nouveau_mot_de_passe": "Pirate-2026-xyz"},
+                                    format="json")
+        self.assertEqual(r.status_code, 403)
 
     def test_patron_change_son_propre_mot_de_passe(self):
         api = self.client_pour(self.patron)
