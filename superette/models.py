@@ -614,6 +614,12 @@ class LigneInventaire(models.Model):
 # ============================================================
 
 class Employe(models.Model):
+    # Compte de l'app de cette personne, s'il en a un (caissier, gérant) :
+    # la fiche de paie et le compte de connexion désignent alors la même
+    # personne. Vide pour un employé qui n'utilise pas l'app.
+    utilisateur = models.OneToOneField(
+        Utilisateur, on_delete=models.SET_NULL, null=True, blank=True, related_name="employe"
+    )
     nom = models.CharField(max_length=100)
     telephone = models.CharField(max_length=20, blank=True)
     poste = models.CharField(max_length=60, blank=True)

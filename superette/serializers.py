@@ -27,9 +27,28 @@ class UtilisateurSerializer(serializers.ModelSerializer):
         # ne doit JAMAIS apparaître dans une réponse JSON.
         fields = [
             "id", "nom", "telephone", "username", "role", "actif", "date_creation",
-            "permissions_supplementaires", "est_compte_principal",
+            "permissions_supplementaires", "est_compte_principal", "employe_id", "salaire_mensuel",
         ]
         read_only_fields = ["date_creation"]
+
+    # Fiche de paie liée (voir Employe.utilisateur) : null si la personne
+    # n'est pas (encore) dans la paie.
+    employe_id = serializers.SerializerMethodField()
+    salaire_mensuel = serializers.SerializerMethodField()
+
+    def _employe(self, obj):
+        try:
+            return obj.employe
+        except Exception:
+            return None
+
+    def get_employe_id(self, obj):
+        e = self._employe(obj)
+        return e.id if e else None
+
+    def get_salaire_mensuel(self, obj):
+        e = self._employe(obj)
+        return e.salaire_mensuel if e else None
 
 
 class CategorieSerializer(serializers.ModelSerializer):
@@ -1693,13 +1712,37 @@ def premier_du_mois(d):
 class EmployeSerializer(serializers.ModelSerializer):
     paye_mois_courant = serializers.SerializerMethodField()
     reste_mois_courant = serializers.SerializerMethodField()
+    utilisateur = serializers.PrimaryKeyRelatedField(
+        queryset=Utilisateur.objects.all(), required=False, allow_null=True
+    )
+    utilisateur_username = serializers.CharField(source="utilisateur.compte.username", read_only=True, default=None)
+    utilisateur_role = serializers.CharField(source="utilisateur.role_id", read_only=True, default=None)
+    nom = serializers.CharField(max_length=100, required=False, allow_blank=True)
 
     class Meta:
         model = Employe
         fields = [
-            "id", "nom", "telephone", "poste", "salaire_mensuel", "date_embauche", "actif",
+            "id", "utilisateur", "utilisateur_username", "utilisateur_role",
+            "nom", "telephone", "poste", "salaire_mensuel", "date_embauche", "actif",
             "paye_mois_courant", "reste_mois_courant",
         ]
+
+    def validate(self, data):
+        utilisateur = data.get("utilisateur", getattr(self.instance, "utilisateur", None))
+        if utilisateur is not None:
+            deja = Employe.objects.filter(utilisateur=utilisateur)
+            if self.instance is not None:
+                deja = deja.exclude(pk=self.instance.pk)
+            if deja.exists():
+                raise serializers.ValidationError({"utilisateur": f"{utilisateur.nom} a déjà une fiche de paie."})
+            # Nom et téléphone repris du compte quand ils ne sont pas saisis.
+            if not (data.get("nom") or getattr(self.instance, "nom", "")):
+                data["nom"] = utilisateur.nom
+            if "telephone" not in data and not getattr(self.instance, "telephone", ""):
+                data["telephone"] = utilisateur.telephone
+        if not (data.get("nom") or getattr(self.instance, "nom", "")):
+            raise serializers.ValidationError({"nom": "Le nom est requis (ou choisis un compte de l'app)."})
+        return data
 
     def _paye(self, obj):
         from django.utils import timezone
