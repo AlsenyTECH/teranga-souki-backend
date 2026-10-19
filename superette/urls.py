@@ -14,6 +14,7 @@ from .views import (
     RetourVenteView, ArchiverCreanceClientView, ArchiverCreanceFournisseurView,
     InventaireListCreateView, InventaireDetailView, InventaireLigneView, InventaireValiderView,
     EmployeViewSet, PaiementSalaireViewSet, ComptabiliteView, SauvegardeView,
+    LivreurViewSet, LivraisonListView, LivraisonDetailView, LivraisonActionView, PaiementLivreurViewSet,
 )
 
 # DefaultRouter génère automatiquement toutes les URLs REST standard
@@ -27,6 +28,8 @@ router.register("depenses", DepenseViewSet)
 router.register("roles", RoleViewSet)
 router.register("employes", EmployeViewSet)
 router.register("paiements-salaire", PaiementSalaireViewSet)
+router.register("livreurs", LivreurViewSet)
+router.register("paiements-livreurs", PaiementLivreurViewSet, basename="paiements-livreurs")
 
 urlpatterns = [
     path("connexion/", ConnexionView.as_view(), name="connexion"),
@@ -59,5 +62,8 @@ urlpatterns = [
     path("inventaires/<int:pk>/valider/", InventaireValiderView.as_view(), name="inventaire-valider"),
     path("comptabilite/", ComptabiliteView.as_view(), name="comptabilite"),
     path("sauvegarde/", SauvegardeView.as_view(), name="sauvegarde"),
+    path("livraisons/", LivraisonListView.as_view(), name="livraisons"),
+    path("livraisons/<int:pk>/", LivraisonDetailView.as_view(), name="livraison-detail"),
+    path("livraisons/<int:pk>/<str:action>/", LivraisonActionView.as_view(), name="livraison-action"),
     path("", include(router.urls)),
 ]

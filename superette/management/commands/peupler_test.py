@@ -40,6 +40,7 @@ from superette.management.commands.nettoyer_test import MODELES
 from superette.models import (
     AjustementStock, Approvisionnement, Categorie, Client, Fournisseur, InstantaneDonneesTest, PaiementFournisseur, Produit,
     RemboursementCredit, RetourAppro, RetourVente, Role, SessionCaisse, TransactionCaisse, Utilisateur,
+    Livraison, Livreur, PaiementLivreur,
 )
 
 PREFIXE_COMPTE = "test_"
@@ -125,6 +126,12 @@ EMPLOYES = [
 # frais et boissons ont une date de péremption, le reste non.
 CONSERVATION = {"Frais": (6, 25), "Boissons": (60, 240), "Épicerie": (120, 400)}
 
+LIVREURS = [
+    # nom, téléphone, type, moyen, rémunération par course
+    ("Modou Jakarta", "770000021", "externe", "Moto Jakarta", 1000),
+    ("Babacar Faye", "780000013", "interne", "À pied / vélo", 0),
+]
+
 DEPENSES_QUOTIDIENNES = [("Transport marchandises", 1500, 4000), ("Sachets et emballages", 500, 2000)]
 
 
@@ -175,6 +182,7 @@ class Command(BaseCommand):
             "paiement_fournisseur": views.PaiementFournisseurView.as_view(**sans_limite),
             "ajustement": views.AjustementStockView.as_view(**sans_limite),
             "depense": views.DepenseViewSet.as_view({"post": "create"}, **sans_limite),
+            "livraison": views.LivraisonActionView.as_view(**sans_limite),
         }
 
     # ------------------------------------------------------------ données de référence
@@ -350,6 +358,18 @@ class Command(BaseCommand):
                 {"mode_paiement": "especes", "montant": str(part_especes)},
                 {"mode_paiement": second, "montant": str(arrondi(total - part_especes))},
             ]
+        # Livraison : environ une vente sur trois d'un client ayant une adresse.
+        if mode != "mixte" and client is not None and client.adresse and self.livreurs and self.rng.random() < 0.3:
+            frais = D(self.rng.choice([500, 1000, 1000, 1500]))
+            a_charge = "client" if self.rng.random() < 0.8 else "boutique"
+            livreur = self.rng.choice(self.livreurs + [None])
+            donnees["livraison"] = {
+                "adresse": client.adresse, "frais": str(frais), "frais_a_charge": a_charge,
+                "instructions": self.rng.choice(["", "", "Appeler en arrivant", "2e étage, porte bleue"]),
+                **({"livreur": livreur.id} if livreur else {}),
+            }
+            if mode in ("especes", "wave", "orange_money") and self.rng.random() < 0.5:
+                mode = "livraison"
         donnees["mode_paiement"] = mode
         if client is not None:
             donnees["client"] = client.id
@@ -377,6 +397,8 @@ class Command(BaseCommand):
                                     peut_remiser="remises" in caissier.permissions_supplementaires)
                 if vente:
                     ventes_du_jour.append(vente)
+
+        self.suivre_livraisons(reperes, admin, final=not fermer)
 
         # Retour client occasionnel, et annulation plus rare (par l'admin).
         if ventes_du_jour and self.rng.random() < 0.35:
@@ -534,6 +556,42 @@ class Command(BaseCommand):
                                                    date_paiement=fin, utilisateur=admin)
             mois = (fin + timedelta(days=1))
 
+    def suivre_livraisons(self, reperes, admin, final):
+        """Fait vivre les livraisons du jour : départ, livraison (ou échec),
+        argent remis en caisse. Aujourd'hui, certaines restent en cours."""
+        for livraison in Livraison.objects.filter(pk__gt=reperes[Livraison]).select_related("vente__utilisateur"):
+            caissier = livraison.vente.utilisateur
+            if final and self.rng.random() < 0.5:
+                if livraison.livreur_id and self.rng.random() < 0.5:
+                    self.appeler(self.v["livraison"], "post", caissier, pk=livraison.pk, action="depart")
+                continue
+            if livraison.livreur_id is None:
+                self.appeler(self.v["livraison"], "post", caissier, {"livreur": self.rng.choice(self.livreurs).id},
+                             pk=livraison.pk, action="assigner")
+            self.appeler(self.v["livraison"], "post", caissier, pk=livraison.pk, action="depart")
+            if self.rng.random() < 0.06:
+                self.appeler(self.v["livraison"], "post", caissier,
+                             {"motif": self.rng.choice(["Client absent", "Adresse introuvable"])},
+                             pk=livraison.pk, action="echec")
+                continue
+            self.appeler(self.v["livraison"], "post", caissier, pk=livraison.pk, action="livree")
+            if livraison.paiement_a_la_livraison:
+                self.appeler(self.v["livraison"], "post", caissier,
+                             {"mode_paiement": self.rng.choice(["especes", "especes", "wave"])},
+                             pk=livraison.pk, action="encaisser")
+
+    def payer_livreurs(self, admin, aujourd_hui):
+        """Le livreur externe est payé chaque semaine pour ses courses."""
+        from superette.serializers import LivreurSerializer
+        for livreur in self.livreurs:
+            solde = LivreurSerializer().get_solde_du(livreur)
+            if livreur.type_livreur == "externe" and solde > 0:
+                PaiementLivreur.objects.create(
+                    livreur=livreur, montant=arrondi(solde * D("0.7"), "1"), mode_paiement="especes",
+                    date_paiement=aujourd_hui - timedelta(days=2), commentaire="Courses de la semaine",
+                    utilisateur=admin,
+                )
+
     def depense(self, admin, jour, categorie, montant, recurrence):
         self.appeler(self.v["depense"], "post", admin, {
             "montant": str(montant), "categorie": categorie, "date_depense": jour.isoformat(),
@@ -551,6 +609,7 @@ class Command(BaseCommand):
         (AjustementStock, "date_heure"),
         (RemboursementCredit, "date_heure"),
         (PaiementFournisseur, "date_heure"),
+        (Livraison, "date_creation"),
     ]
 
     def reperes(self):
@@ -571,6 +630,15 @@ class Command(BaseCommand):
         pas = timedelta(minutes=13 * 60 / max(len(nouveaux), 1))
         for i, (_, modele, champ, pk) in enumerate(nouveaux):
             modele.objects.filter(pk=pk).update(**{champ: debut + pas * i})
+        # Les étapes de chaque livraison suivent sa création.
+        for livraison in Livraison.objects.filter(pk__gt=reperes[Livraison]):
+            depart = livraison.date_creation + timedelta(minutes=15)
+            arrivee = depart + timedelta(minutes=self.rng.randint(20, 50))
+            Livraison.objects.filter(pk=livraison.pk).update(
+                date_depart=depart if livraison.date_depart else None,
+                date_fin=arrivee if livraison.date_fin else None,
+                date_encaissement=arrivee + timedelta(minutes=30) if livraison.date_encaissement else None,
+            )
         fin = timezone.make_aware(datetime.combine(jour, time(21, 30)))
         SessionCaisse.objects.filter(pk__gt=reperes[SessionCaisse], date_fermeture__isnull=False).update(date_fermeture=fin)
         TransactionCaisse.objects.filter(date_annulation__gt=debut + timedelta(days=1)).update(date_annulation=fin)
@@ -618,6 +686,11 @@ class Command(BaseCommand):
                 ) for n, t, a in CLIENTS
             ]
 
+            self.livreurs = [
+                Livreur.objects.create(nom=n + suffixe, telephone=t, type_livreur=ty, moyen=m,
+                                       remuneration_par_course=D(r))
+                for n, t, ty, m, r in LIVREURS
+            ]
             aujourd_hui = timezone.localdate()
             premier_jour = aujourd_hui - timedelta(days=jours)
             self.premier_jour = premier_jour
@@ -636,12 +709,17 @@ class Command(BaseCommand):
             self.stocks_bas(comptes["test_admin"], produits)
             self.peremptions(produits)
             self.salaires(comptes["test_admin"], premier_jour, aujourd_hui, suffixe)
+            # Le livreur interne est l'aide rayon : sa fiche livreur est liée à sa fiche employé.
+            from superette.models import Employe
+            Livreur.objects.filter(pk=self.livreurs[1].pk).update(
+                employe=Employe.objects.filter(nom__startswith="Babacar Faye").order_by("-pk").first())
+            self.payer_livreurs(comptes["test_admin"], aujourd_hui)
 
         self.stdout.write(self.style.SUCCESS(
             f"\nDonnées de test créées : {jours} jours d'historique + aujourd'hui (caisses ouvertes).\n"
             f"  {Produit.objects.count()} produits, {Client.objects.count()} clients, "
             f"{Fournisseur.objects.count()} fournisseurs, {TransactionCaisse.objects.count()} ventes, "
-            f"{Approvisionnement.objects.count()} réceptions, {SessionCaisse.objects.count()} sessions de caisse.\n\n"
+            f"{Approvisionnement.objects.count()} réceptions, {Livraison.objects.count()} livraisons, {SessionCaisse.objects.count()} sessions de caisse.\n\n"
             f"Comptes de test (mot de passe commun : {mot_de_passe}) :\n"
             f"  test_admin      admin\n"
             f"  test_caissier1  caissier (sans permission supplémentaire)\n"

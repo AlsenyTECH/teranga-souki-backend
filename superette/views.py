@@ -163,7 +163,7 @@ class VenteView(APIView):
     def get(self, request):
         qs = TransactionCaisse.objects.filter(
             venteproduits__isnull=False
-        ).select_related("utilisateur", "client", "venteproduits").prefetch_related(
+        ).select_related("utilisateur", "client", "venteproduits", "livraison__livreur").prefetch_related(
             "venteproduits__lignes__produit", "venteproduits__lignes__retours", "retours", "paiements",
         ).order_by("-date_heure")
         # ?client=<id> : historique des ventes d'un client précis, pour
@@ -384,6 +384,18 @@ def calculer_totaux_periode(debut, fin):
         date_paiement__gte=debut, date_paiement__lte=fin
     ).aggregate(total=Coalesce(Sum("montant"), 0, output_field=DecimalField()))["total"]
 
+    # Livraisons : les frais payés par le client sont un revenu (déjà dans
+    # le CA, mais pas dans la marge produits) ; la rémunération des
+    # livreurs pour les courses livrées sur la période est une charge.
+    from .models import Livraison as LivraisonModel
+    frais_livraison = LivraisonModel.objects.filter(
+        vente__in=ventes_qs, frais_a_charge="client"
+    ).aggregate(total=Coalesce(Sum("frais"), 0, output_field=DecimalField()))["total"]
+    marge = marge + frais_livraison
+    cout_livraisons = LivraisonModel.objects.filter(
+        statut="livree", date_fin__date__gte=debut, date_fin__date__lte=fin, vente__annulee=False
+    ).aggregate(total=Coalesce(Sum("remuneration_livreur"), 0, output_field=DecimalField()))["total"]
+
     chiffre_affaires_total = ca_ventes
     deux = Decimal("0.01")
     return {
@@ -396,9 +408,11 @@ def calculer_totaux_periode(debut, fin):
         "marge_brute_ventes": Decimal(marge).quantize(deux),
         "total_depenses": Decimal(total_depenses).quantize(deux),
         "total_salaires": Decimal(total_salaires).quantize(deux),
+        "frais_livraison_factures": Decimal(frais_livraison).quantize(deux),
+        "cout_livraisons": Decimal(cout_livraisons).quantize(deux),
         # Bénéfice réel : ce qu'il reste une fois payées les marchandises
-        # vendues (marge), les charges (dépenses) et les salaires.
-        "resultat_net": Decimal(marge - total_depenses - total_salaires).quantize(deux),
+        # vendues (marge), les charges (dépenses), les salaires et les livreurs.
+        "resultat_net": Decimal(marge - total_depenses - total_salaires - cout_livraisons).quantize(deux),
     }
 
 
@@ -846,6 +860,13 @@ class AnnulerVenteView(APIView):
                                f"({especes_a_rendre} F) avant de l'annuler."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+            livraison = getattr(transaction_caisse, "livraison", None)
+            if livraison is not None and livraison.statut != "annulee":
+                from .serializers import ajouter_historique
+                livraison.statut = "annulee"
+                ajouter_historique(livraison, "Vente annulée", request.user.utilisateur)
+                livraison.save(update_fields=["statut", "historique"])
 
             vente = getattr(transaction_caisse, "venteproduits", None)
             if vente is not None:
@@ -1339,6 +1360,7 @@ from .models import (
     Approvisionnement as ApproModel, PaiementFournisseur as PaiementFournisseurModel,
     RemboursementCredit as RemboursementModel, PaiementVente, Client as ClientModel,
     Fournisseur as FournisseurModel, Produit as ProduitModel, RetourVente as RetourVenteModel,
+    Livraison as LivraisonModel, PaiementLivreur as PaiementLivreurModel,
 )
 
 
@@ -1360,7 +1382,10 @@ def tresorerie_periode(debut, fin):
         mixte = _somme(PaiementVente.objects.filter(vente__in=ventes.filter(mode_paiement="mixte"), mode_paiement=mode))
         rembourse = _somme(RemboursementModel.objects.filter(
             date_heure__date__gte=debut, date_heure__date__lte=fin, mode_paiement=mode))
-        encaissements[mode] = _q(direct + mixte + rembourse)
+        livraisons = _somme(LivraisonModel.objects.filter(
+            date_encaissement__date__gte=debut, date_encaissement__date__lte=fin,
+            mode_encaissement=mode, vente__annulee=False), "montant_a_encaisser")
+        encaissements[mode] = _q(direct + mixte + rembourse + livraisons)
     ventes_a_credit = _somme(ventes.filter(mode_paiement="credit"), "montant_total") + _somme(
         PaiementVente.objects.filter(vente__in=ventes.filter(mode_paiement="mixte"), mode_paiement="credit"))
 
@@ -1371,8 +1396,10 @@ def tresorerie_periode(debut, fin):
         date_heure__date__gte=debut, date_heure__date__lte=fin, affecte_caisse=True), "montant_total")
     depenses = _somme(DepenseModel.objects.filter(date_depense__gte=debut, date_depense__lte=fin))
     salaires = _somme(PaiementSalaire.objects.filter(date_paiement__gte=debut, date_paiement__lte=fin))
+    livreurs = _somme(PaiementLivreurModel.objects.filter(date_paiement__gte=debut, date_paiement__lte=fin))
     decaissements = {
-        "fournisseurs": _q(achats), "depenses": _q(depenses), "salaires": _q(salaires), "retours_clients": _q(retours),
+        "fournisseurs": _q(achats), "depenses": _q(depenses), "salaires": _q(salaires),
+        "livreurs": _q(livreurs), "retours_clients": _q(retours),
     }
     total_in = sum(encaissements.values(), Decimal("0"))
     total_out = sum(decaissements.values(), Decimal("0"))
@@ -1415,10 +1442,12 @@ class ComptabiliteView(APIView):
                 "marge_brute": t["marge_brute_ventes"],
                 "depenses": t["total_depenses"],
                 "salaires": t["total_salaires"],
+                "livraisons": t["cout_livraisons"],
                 "resultat_net": t["resultat_net"],
                 "nb_ventes": t["ventes_qs"].count(),
             })
-        cles = ["chiffre_affaires", "cout_marchandises", "marge_brute", "depenses", "salaires", "resultat_net", "nb_ventes"]
+        cles = ["chiffre_affaires", "cout_marchandises", "marge_brute", "depenses", "salaires", "livraisons",
+                "resultat_net", "nb_ventes"]
         total = {c: sum((m[c] for m in mois), Decimal("0") if c != "nb_ventes" else 0) for c in cles}
         debut_annee, fin_annee = date_cls(annee, 1, 1), date_cls(annee, 12, 31)
         par_categorie = (
@@ -1474,3 +1503,119 @@ class SauvegardeView(APIView):
         reponse["Content-Disposition"] = f'attachment; filename="{nom}"'
         reponse["Access-Control-Expose-Headers"] = "Content-Disposition"
         return reponse
+
+
+# ============================================================
+# Livraisons : livreurs (internes / externes), suivi de chaque course
+# (qui, quand, quel statut) et rémunération des livreurs.
+# ============================================================
+
+from .models import Livreur, Livraison, PaiementLivreur
+from .serializers import (
+    LivreurSerializer, LivraisonSerializer, PaiementLivreurSerializer, action_livraison,
+)
+
+
+class LivreurViewSet(viewsets.ModelViewSet):
+    """/api/livreurs/ — tout le monde voit les livreurs (pour en choisir un
+    en caisse), seul l'admin les crée ou les modifie."""
+    queryset = Livreur.objects.select_related("employe").order_by("-actif", "nom")
+    serializer_class = LivreurSerializer
+    permission_classes = [LectureAdminEcritureAdmin]
+
+    def destroy(self, request, *args, **kwargs):
+        livreur = self.get_object()
+        if livreur.livraisons.exists():
+            # On garde la trace des courses : on désactive au lieu de supprimer.
+            livreur.actif = False
+            livreur.save(update_fields=["actif"])
+            return Response({"detail": "Livreur désactivé (il a un historique de livraisons)."})
+        return super().destroy(request, *args, **kwargs)
+
+
+def _livraisons_visibles(utilisateur):
+    qs = Livraison.objects.select_related(
+        "livreur", "utilisateur", "vente__client", "vente__utilisateur", "vente__venteproduits",
+    ).prefetch_related(
+        "vente__venteproduits__lignes__produit", "vente__venteproduits__lignes__retours",
+        "vente__retours", "vente__paiements",
+    ).order_by("-date_creation")
+    return qs
+
+
+class LivraisonListView(APIView):
+    """GET /api/livraisons/?statut=en_attente,en_cours&livreur=3&date_debut=&date_fin="""
+    permission_classes = [EstCaissierOuAdmin]
+
+    def get(self, request):
+        qs = _livraisons_visibles(request.user.utilisateur)
+        statut = request.query_params.get("statut")
+        if statut:
+            qs = qs.filter(statut__in=statut.split(","))
+        livreur = request.query_params.get("livreur")
+        if livreur:
+            qs = qs.filter(livreur_id=livreur)
+        if request.query_params.get("a_encaisser") == "1":
+            qs = qs.filter(paiement_a_la_livraison=True, encaisse=False).exclude(statut="annulee")
+        qs = filtrer_par_dates(qs, request, "date_creation")
+        return reponse_liste(request, self, qs, LivraisonSerializer)
+
+
+class LivraisonDetailView(APIView):
+    permission_classes = [EstCaissierOuAdmin]
+
+    def get(self, request, pk):
+        try:
+            livraison = _livraisons_visibles(request.user.utilisateur).get(pk=pk)
+        except Livraison.DoesNotExist:
+            return Response({"detail": "Livraison introuvable."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(LivraisonSerializer(livraison).data)
+
+    def patch(self, request, pk):
+        """Corrige l'adresse, le contact ou les instructions (pas les montants)."""
+        try:
+            livraison = Livraison.objects.get(pk=pk)
+        except Livraison.DoesNotExist:
+            return Response({"detail": "Livraison introuvable."}, status=status.HTTP_404_NOT_FOUND)
+        from .serializers import ajouter_historique
+        champs = [c for c in ("adresse", "contact_nom", "contact_telephone", "instructions") if c in request.data]
+        for c in champs:
+            setattr(livraison, c, str(request.data[c])[:255])
+        if not livraison.adresse:
+            raise ValidationError({"adresse": "L'adresse est obligatoire."})
+        if champs:
+            ajouter_historique(livraison, "Informations modifiées", request.user.utilisateur, ", ".join(champs))
+            livraison.save()
+        return Response(LivraisonSerializer(_livraisons_visibles(None).get(pk=pk)).data)
+
+
+class LivraisonActionView(APIView):
+    """POST /api/livraisons/<id>/<action>/ — action : assigner, depart,
+    livree, echec, encaisser. Chaque étape est horodatée dans l'historique."""
+    permission_classes = [EstCaissierOuAdmin]
+    ACTIONS = {"assigner", "depart", "livree", "echec", "encaisser"}
+
+    def post(self, request, pk, action):
+        if action not in self.ACTIONS:
+            return Response({"detail": "Action inconnue."}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            livraison = Livraison.objects.get(pk=pk)
+        except Livraison.DoesNotExist:
+            return Response({"detail": "Livraison introuvable."}, status=status.HTTP_404_NOT_FOUND)
+        action_livraison(livraison, action, request.user.utilisateur, request.data)
+        return Response(LivraisonSerializer(_livraisons_visibles(None).get(pk=pk)).data)
+
+
+class PaiementLivreurViewSet(viewsets.ModelViewSet):
+    """/api/paiements-livreurs/?livreur=<id> — ce que la boutique a payé à ses livreurs."""
+    serializer_class = PaiementLivreurSerializer
+    permission_classes = [EstAdmin]
+    http_method_names = ["get", "post", "delete"]
+
+    def get_queryset(self):
+        qs = PaiementLivreur.objects.select_related("livreur", "utilisateur").order_by("-date_paiement", "-id")
+        livreur = self.request.query_params.get("livreur")
+        return qs.filter(livreur_id=livreur) if livreur else qs
+
+    def perform_create(self, serializer):
+        serializer.save(utilisateur=self.request.user.utilisateur)
