@@ -29,7 +29,7 @@ from superette.models import (
     Depense, Fournisseur, InstantaneDonneesTest, LigneAppro, LigneRetour, LigneRetourAppro, LigneVente, PaiementFournisseur,
     PaiementVente, Produit, RemboursementCredit, RetourAppro, RetourVente,
     SessionCaisse, TransactionCaisse, Utilisateur, VenteProduits,
-    Inventaire, LigneInventaire, Employe, PaiementSalaire,
+    Inventaire, LigneInventaire, Employe, PaiementSalaire, Livraison, Livreur, PaiementLivreur,
 )
 
 PREFIXE_COMPTE = "test_"
@@ -38,6 +38,7 @@ PREFIXE_COMPTE = "test_"
 # (les clés étrangères sont en PROTECT, l'ordre compte).
 MODELES = [
     LigneRetour, RetourVente, LigneRetourAppro, RetourAppro,
+    Livraison, PaiementLivreur, Livreur,
     PaiementVente, LigneVente, VenteProduits, TransactionCaisse,
     LigneAppro, Approvisionnement,
     RemboursementCredit, PaiementFournisseur, ArchiveCreanceClient, ArchiveCreanceFournisseur,
@@ -49,6 +50,7 @@ MODELES = [
 AVEC_UTILISATEUR = [
     TransactionCaisse, RetourVente, RetourAppro, SessionCaisse, AjustementStock, RemboursementCredit,
     PaiementFournisseur, Depense, ArchiveCreanceClient, ArchiveCreanceFournisseur, Inventaire, PaiementSalaire,
+    Livraison, PaiementLivreur,
 ]
 
 

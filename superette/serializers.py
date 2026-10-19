@@ -145,6 +145,7 @@ class FournisseurSerializer(serializers.ModelSerializer):
 
 from django.db import transaction
 from django.db.models import F, Sum
+from .models import Livreur, Livraison, PaiementLivreur, StatutLivraison
 from .models import TransactionCaisse, VenteProduits, LigneVente, SessionCaisse, StatutSession, PaiementVente
 from .permissions import peut_accorder_remises
 
@@ -199,6 +200,44 @@ def _prix_ligne(ligne, produit):
     return prix if prix is not None else produit.prix_pour(ligne["quantite"])
 
 
+class LivraisonEcritureSerializer(serializers.Serializer):
+    """Option « livraison » d'une vente (POST /api/ventes/, clé "livraison")."""
+    adresse = serializers.CharField(max_length=255)
+    contact_nom = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    contact_telephone = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    instructions = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    frais = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False)
+    frais_a_charge = serializers.ChoiceField(choices=["client", "boutique"], required=False)
+    livreur = serializers.PrimaryKeyRelatedField(queryset=Livreur.objects.filter(actif=True), required=False, allow_null=True)
+    remuneration_livreur = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0"), required=False)
+
+
+def frais_factures(livraison_data):
+    """Frais ajoutés au ticket : seulement s'ils sont à la charge du client."""
+    if not livraison_data or livraison_data.get("frais_a_charge", "client") != "client":
+        return Decimal("0")
+    return livraison_data.get("frais") or Decimal("0")
+
+
+def remuneration_par_defaut(livreur, frais):
+    """Livreur externe : le prix de sa course (ou les frais de la livraison) ;
+    livreur de la boutique : rien, il est déjà payé au mois."""
+    if livreur is None or livreur.type_livreur != "externe":
+        return Decimal("0")
+    return livreur.remuneration_par_course if livreur.remuneration_par_course > 0 else (frais or Decimal("0"))
+
+
+def ajouter_historique(livraison, action, utilisateur, detail=""):
+    from django.utils import timezone as tz
+    livraison.historique = [*(livraison.historique or []), {
+        "date": tz.now().isoformat(),
+        "statut": livraison.statut,
+        "action": action,
+        "utilisateur": getattr(utilisateur, "nom", str(utilisateur)),
+        "detail": detail,
+    }]
+
+
 class VenteCreationSerializer(serializers.Serializer):
     """
     Serializer d'ÉCRITURE pour créer une vente complète en un seul
@@ -226,8 +265,10 @@ class VenteCreationSerializer(serializers.Serializer):
     client = serializers.PrimaryKeyRelatedField(
         queryset=Client.objects.all(), required=False, allow_null=True
     )
-    mode_paiement = serializers.ChoiceField(choices=["especes", "wave", "orange_money", "credit", "mixte"])
+    mode_paiement = serializers.ChoiceField(choices=["especes", "wave", "orange_money", "credit", "mixte", "livraison"])
     lignes = LigneVenteEcritureSerializer(many=True)
+    # Vente à livrer (adresse, frais, livreur...) — voir LivraisonEcritureSerializer.
+    livraison = LivraisonEcritureSerializer(required=False, allow_null=True)
     # Réduction sur le total de la vente (montant, pas pourcentage — le
     # frontend calcule déjà un éventuel pourcentage en montant avant
     # l'envoi, pour que le serveur n'ait qu'une seule règle à valider).
@@ -249,6 +290,11 @@ class VenteCreationSerializer(serializers.Serializer):
         if data.get("mode_paiement") == "credit" and not data.get("client"):
             raise serializers.ValidationError(
                 "Une vente à crédit doit être attribuée à un client identifié (pas anonyme)."
+            )
+
+        if data.get("mode_paiement") == "livraison" and not data.get("livraison"):
+            raise serializers.ValidationError(
+                "Le paiement à la livraison n'est possible que pour une vente livrée (renseigne la livraison)."
             )
 
         paiements = data.get("paiements")
@@ -300,7 +346,7 @@ class VenteCreationSerializer(serializers.Serializer):
 
         if paiements:
             total_paiements = sum(p["montant"] for p in paiements)
-            total_attendu = sous_total - reduction
+            total_attendu = sous_total - reduction + frais_factures(data.get("livraison"))
             if abs(total_paiements - total_attendu) > Decimal("0.01"):
                 raise serializers.ValidationError(
                     f"La somme des paiements ({total_paiements} F) ne correspond pas "
@@ -357,7 +403,8 @@ class VenteCreationSerializer(serializers.Serializer):
             # encaissé, puisque les points fidélité et l'incrément du
             # solde crédit (plus bas) se basent dessus.
             reduction = validated_data.get("reduction_montant") or Decimal("0")
-            montant_total = (montant_total - reduction).quantize(Decimal("0.01"))
+            livraison_data = validated_data.get("livraison")
+            montant_total = (montant_total - reduction + frais_factures(livraison_data)).quantize(Decimal("0.01"))
 
             transaction_caisse = TransactionCaisse.objects.create(
                 montant_total=montant_total,
@@ -421,6 +468,28 @@ class VenteCreationSerializer(serializers.Serializer):
                     client.solde_credit = F("solde_credit") + montant_credit
                     client.save(update_fields=["solde_credit"])
 
+            if livraison_data:
+                livreur = livraison_data.get("livreur")
+                frais = livraison_data.get("frais") or Decimal("0")
+                remuneration = livraison_data.get("remuneration_livreur")
+                livraison = Livraison(
+                    vente=transaction_caisse,
+                    livreur=livreur,
+                    adresse=livraison_data["adresse"],
+                    contact_nom=livraison_data.get("contact_nom") or (client.nom if client else ""),
+                    contact_telephone=livraison_data.get("contact_telephone") or ((client.telephone or "") if client else ""),
+                    instructions=livraison_data.get("instructions", ""),
+                    frais=frais,
+                    frais_a_charge=livraison_data.get("frais_a_charge", "client"),
+                    remuneration_livreur=remuneration if remuneration is not None else remuneration_par_defaut(livreur, frais),
+                    paiement_a_la_livraison=validated_data["mode_paiement"] == "livraison",
+                    montant_a_encaisser=montant_total if validated_data["mode_paiement"] == "livraison" else Decimal("0"),
+                    utilisateur=utilisateur,
+                )
+                ajouter_historique(livraison, "Livraison créée", utilisateur,
+                                   f"Livreur : {livreur.nom}" if livreur else "Livreur à choisir")
+                livraison.save()
+
             return transaction_caisse
 
 
@@ -444,6 +513,7 @@ class TransactionCaisseLectureSerializer(serializers.ModelSerializer):
     montant_net = serializers.SerializerMethodField()
     # Liste vide pour toute vente non-mixte — champ additif.
     paiements = PaiementVenteLectureSerializer(many=True, read_only=True)
+    livraison = serializers.SerializerMethodField()
 
     class Meta:
         model = TransactionCaisse
@@ -451,8 +521,21 @@ class TransactionCaisseLectureSerializer(serializers.ModelSerializer):
             "id", "date_heure", "montant_total", "mode_paiement",
             "caissier_nom", "client_nom", "client_telephone", "client_adresse", "annulee", "lignes",
             "reduction_montant", "sous_total", "montant_retourne", "montant_net", "paiements",
-            "date_annulation", "montant_annulation_especes",
+            "date_annulation", "montant_annulation_especes", "livraison",
         ]
+
+    def get_livraison(self, obj):
+        livraison = getattr(obj, "livraison", None)
+        if livraison is None:
+            return None
+        return {
+            "id": livraison.id, "statut": livraison.statut, "adresse": livraison.adresse,
+            "contact_nom": livraison.contact_nom, "contact_telephone": livraison.contact_telephone,
+            "frais": livraison.frais, "frais_a_charge": livraison.frais_a_charge,
+            "livreur_nom": livraison.livreur.nom if livraison.livreur else None,
+            "paiement_a_la_livraison": livraison.paiement_a_la_livraison,
+            "montant_a_encaisser": livraison.montant_a_encaisser, "encaisse": livraison.encaisse,
+        }
 
     def get_client_telephone(self, obj):
         return obj.client.telephone if obj.client else None
@@ -1453,6 +1536,10 @@ def part_especes(transaction_caisse):
             (p.montant for p in transaction_caisse.paiements.all() if p.mode_paiement == "especes"),
             Decimal("0"),
         )
+    if transaction_caisse.mode_paiement == "livraison":
+        livraison = getattr(transaction_caisse, "livraison", None)
+        if livraison is not None and livraison.encaisse and livraison.mode_encaissement == "especes":
+            return livraison.montant_a_encaisser
     return Decimal("0")
 
 
@@ -1492,13 +1579,19 @@ def calculer_totaux_session(session):
     remboursements_credit_especes = RemboursementCredit.objects.filter(
         session_caisse=session, mode_paiement="especes"
     ).aggregate(total=Sum("montant"))["total"] or Decimal("0")
+    # Argent des ventes payées à la livraison, rapporté par le livreur et
+    # remis en espèces dans CETTE session.
+    livraisons_especes = Livraison.objects.filter(
+        session_encaissement=session, mode_encaissement="especes"
+    ).aggregate(total=Sum("montant_a_encaisser"))["total"] or Decimal("0")
 
     montant_attendu = (
-        session.fond_ouverture + ventes_especes + remboursements_credit_especes
+        session.fond_ouverture + ventes_especes + remboursements_credit_especes + livraisons_especes
         - retours_especes - annulations_especes
     )
     totaux = {
         "ventes_especes": ventes_especes,
+        "livraisons_especes": livraisons_especes,
         "retours_especes": retours_especes,
         "annulations_especes": annulations_especes,
         "remboursements_credit_especes": remboursements_credit_especes,
@@ -1798,3 +1891,156 @@ class PaiementSalaireSerializer(serializers.ModelSerializer):
                     "Utilise « Prime » pour un montant en plus."
                 )
         return data
+
+
+# ============================================================
+# Livraisons et livreurs
+# ============================================================
+
+class LivreurSerializer(serializers.ModelSerializer):
+    employe_nom = serializers.CharField(source="employe.nom", read_only=True, default=None)
+    nb_livraisons = serializers.SerializerMethodField()
+    nb_en_cours = serializers.SerializerMethodField()
+    total_du = serializers.SerializerMethodField()
+    total_paye = serializers.SerializerMethodField()
+    solde_du = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Livreur
+        fields = [
+            "id", "nom", "telephone", "type_livreur", "moyen", "employe", "employe_nom",
+            "remuneration_par_course", "actif", "nb_livraisons", "nb_en_cours", "total_du", "total_paye", "solde_du",
+        ]
+
+    def get_nb_livraisons(self, obj):
+        return obj.livraisons.filter(statut=StatutLivraison.LIVREE).count()
+
+    def get_nb_en_cours(self, obj):
+        return obj.livraisons.filter(statut__in=[StatutLivraison.EN_ATTENTE, StatutLivraison.EN_COURS]).count()
+
+    def get_total_du(self, obj):
+        return obj.livraisons.filter(statut=StatutLivraison.LIVREE).aggregate(
+            t=Sum("remuneration_livreur"))["t"] or Decimal("0")
+
+    def get_total_paye(self, obj):
+        return obj.paiements.aggregate(t=Sum("montant"))["t"] or Decimal("0")
+
+    def get_solde_du(self, obj):
+        return self.get_total_du(obj) - self.get_total_paye(obj)
+
+
+class LivraisonSerializer(serializers.ModelSerializer):
+    livreur_nom = serializers.CharField(source="livreur.nom", read_only=True, default=None)
+    livreur_telephone = serializers.CharField(source="livreur.telephone", read_only=True, default=None)
+    utilisateur_nom = serializers.StringRelatedField(source="utilisateur", read_only=True)
+    vente = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Livraison
+        fields = [
+            "id", "vente", "statut", "livreur", "livreur_nom", "livreur_telephone", "adresse", "contact_nom",
+            "contact_telephone", "instructions", "frais", "frais_a_charge", "remuneration_livreur",
+            "paiement_a_la_livraison", "montant_a_encaisser", "encaisse", "mode_encaissement", "date_encaissement",
+            "utilisateur_nom", "date_creation", "date_depart", "date_fin", "motif_echec", "historique",
+        ]
+
+    def get_vente(self, obj):
+        return TransactionCaisseLectureSerializer(obj.vente).data
+
+
+class PaiementLivreurSerializer(serializers.ModelSerializer):
+    livreur_nom = serializers.CharField(source="livreur.nom", read_only=True)
+    utilisateur_nom = serializers.StringRelatedField(source="utilisateur", read_only=True)
+
+    class Meta:
+        model = PaiementLivreur
+        fields = ["id", "livreur", "livreur_nom", "montant", "mode_paiement", "date_paiement", "commentaire",
+                  "utilisateur_nom", "date_heure"]
+        read_only_fields = ["date_heure"]
+
+    def validate(self, data):
+        livreur = data["livreur"]
+        solde = LivreurSerializer().get_solde_du(livreur)
+        if data["montant"] > solde:
+            raise serializers.ValidationError(
+                f"On ne doit que {solde:.0f} F à {livreur.nom} (courses livrées moins paiements déjà faits)."
+            )
+        return data
+
+
+def action_livraison(livraison, action, utilisateur, donnees):
+    """Fait avancer une livraison d'une étape, avec verrou et traçabilité.
+    action : assigner | depart | livree | echec | encaisser."""
+    from django.utils import timezone as tz
+    with transaction.atomic():
+        livraison = Livraison.objects.select_for_update().select_related("vente", "livreur").get(pk=livraison.pk)
+        if livraison.vente.annulee and action != "encaisser":
+            raise serializers.ValidationError("La vente a été annulée : cette livraison est close.")
+        terminee = livraison.statut in (StatutLivraison.LIVREE, StatutLivraison.ECHOUEE, StatutLivraison.ANNULEE)
+
+        if action == "assigner":
+            if terminee:
+                raise serializers.ValidationError("Livraison déjà terminée.")
+            try:
+                livreur = Livreur.objects.get(pk=donnees.get("livreur"), actif=True)
+            except (Livreur.DoesNotExist, ValueError, TypeError):
+                raise serializers.ValidationError({"livreur": "Choisis un livreur actif."})
+            livraison.livreur = livreur
+            remuneration = donnees.get("remuneration_livreur")
+            livraison.remuneration_livreur = (
+                Decimal(str(remuneration)) if remuneration not in (None, "")
+                else remuneration_par_defaut(livreur, livraison.frais)
+            )
+            ajouter_historique(livraison, "Livreur assigné", utilisateur,
+                               f"{livreur.nom} · rémunération {livraison.remuneration_livreur:.0f} F")
+        elif action == "depart":
+            if livraison.statut != StatutLivraison.EN_ATTENTE:
+                raise serializers.ValidationError("Seule une livraison en attente peut partir.")
+            if livraison.livreur is None:
+                raise serializers.ValidationError("Assigne d'abord un livreur.")
+            livraison.statut = StatutLivraison.EN_COURS
+            livraison.date_depart = tz.now()
+            ajouter_historique(livraison, "Parti en livraison", utilisateur, livraison.livreur.nom)
+        elif action == "livree":
+            if livraison.statut not in (StatutLivraison.EN_ATTENTE, StatutLivraison.EN_COURS):
+                raise serializers.ValidationError("Cette livraison est déjà terminée.")
+            if livraison.livreur is None:
+                raise serializers.ValidationError("Assigne d'abord le livreur qui a livré.")
+            livraison.statut = StatutLivraison.LIVREE
+            livraison.date_fin = tz.now()
+            if livraison.date_depart is None:
+                livraison.date_depart = livraison.date_fin
+            ajouter_historique(livraison, "Livrée au client", utilisateur, donnees.get("commentaire", ""))
+        elif action == "echec":
+            if livraison.statut not in (StatutLivraison.EN_ATTENTE, StatutLivraison.EN_COURS):
+                raise serializers.ValidationError("Cette livraison est déjà terminée.")
+            motif = (donnees.get("motif") or "").strip()
+            if not motif:
+                raise serializers.ValidationError({"motif": "Indique pourquoi la livraison a échoué."})
+            livraison.statut = StatutLivraison.ECHOUEE
+            livraison.date_fin = tz.now()
+            livraison.motif_echec = motif
+            ajouter_historique(livraison, "Livraison échouée", utilisateur, motif)
+        elif action == "encaisser":
+            if not livraison.paiement_a_la_livraison:
+                raise serializers.ValidationError("Cette vente a déjà été payée en caisse.")
+            if livraison.encaisse:
+                raise serializers.ValidationError("L'argent de cette livraison a déjà été remis en caisse.")
+            if livraison.statut != StatutLivraison.LIVREE:
+                raise serializers.ValidationError("Marque d'abord la livraison comme livrée.")
+            mode = donnees.get("mode_paiement", "especes")
+            if mode not in ("especes", "wave", "orange_money"):
+                raise serializers.ValidationError({"mode_paiement": "Mode invalide."})
+            session = SessionCaisse.objects.filter(utilisateur=utilisateur, statut=StatutSession.OUVERTE).first()
+            if session is None:
+                raise serializers.ValidationError("Ouvre ta caisse pour y remettre l'argent de la livraison.")
+            livraison.encaisse = True
+            livraison.mode_encaissement = mode
+            livraison.session_encaissement = session
+            livraison.date_encaissement = tz.now()
+            ajouter_historique(livraison, "Argent remis en caisse", utilisateur,
+                               f"{livraison.montant_a_encaisser:.0f} F · {mode}")
+        else:
+            raise serializers.ValidationError("Action inconnue.")
+        livraison.save()
+        return livraison

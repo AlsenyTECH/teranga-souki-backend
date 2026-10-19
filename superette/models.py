@@ -200,6 +200,10 @@ class ModePaiement(models.TextChoices):
     # de paiement elle-même, seulement comme mode de la transaction
     # globale quand elle est ainsi scindée.
     MIXTE = "mixte", "Paiement mixte"
+    # Vente livrée et payée au livreur à la livraison : rien n'est encaissé
+    # au départ ; le montant entre en caisse quand le livreur rapporte
+    # l'argent (Livraison.encaisser, mode réel : espèces, Wave...).
+    LIVRAISON = "livraison", "À encaisser à la livraison"
 
 
 class TransactionCaisse(models.Model):
@@ -659,3 +663,106 @@ class PaiementSalaire(models.Model):
 
     def __str__(self):
         return f"{self.employe} - {self.type_paiement} {self.montant} F"
+
+
+# ============================================================
+# Livraisons — une vente peut être livrée au client par un livreur
+# (de la boutique ou externe, payé à la course). Chaque étape est
+# horodatée et tracée (qui a fait quoi, quand) dans `historique`.
+# ============================================================
+
+class TypeLivreur(models.TextChoices):
+    INTERNE = "interne", "Livreur de la boutique"
+    EXTERNE = "externe", "Livreur externe"
+
+
+class Livreur(models.Model):
+    nom = models.CharField(max_length=100)
+    telephone = models.CharField(max_length=20)
+    type_livreur = models.CharField(max_length=10, choices=TypeLivreur.choices, default=TypeLivreur.EXTERNE)
+    # Moyen de transport, informatif (moto Jakarta, vélo, voiture...).
+    moyen = models.CharField(max_length=40, blank=True)
+    # Fiche de paie liée pour un livreur de la boutique (salarié).
+    employe = models.OneToOneField(Employe, on_delete=models.SET_NULL, null=True, blank=True, related_name="livreur")
+    # Rémunération proposée par défaut pour une course (modifiable à chaque livraison).
+    remuneration_par_course = models.DecimalField(max_digits=10, decimal_places=2, default=0,
+                                                  validators=[MinValueValidator(0)])
+    actif = models.BooleanField(default=True)
+    date_creation = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["nom"]
+
+    def __str__(self):
+        return self.nom
+
+
+class StatutLivraison(models.TextChoices):
+    EN_ATTENTE = "en_attente", "En attente"
+    EN_COURS = "en_cours", "En cours de livraison"
+    LIVREE = "livree", "Livrée"
+    ECHOUEE = "echouee", "Échouée"
+    ANNULEE = "annulee", "Annulée"
+
+
+class FraisLivraisonACharge(models.TextChoices):
+    CLIENT = "client", "Payés par le client"
+    BOUTIQUE = "boutique", "Offerts par Teranga Souki"
+
+
+class Livraison(models.Model):
+    vente = models.OneToOneField(TransactionCaisse, on_delete=models.PROTECT, related_name="livraison")
+    livreur = models.ForeignKey(Livreur, on_delete=models.PROTECT, null=True, blank=True, related_name="livraisons")
+    statut = models.CharField(max_length=12, choices=StatutLivraison.choices, default=StatutLivraison.EN_ATTENTE)
+    adresse = models.CharField(max_length=255)
+    contact_nom = models.CharField(max_length=100, blank=True)
+    contact_telephone = models.CharField(max_length=20, blank=True)
+    instructions = models.CharField(max_length=255, blank=True)
+    # Prix de la course et qui le paie : à la charge du client, il est
+    # ajouté au ticket ; offert, il n'apparaît pas sur le ticket.
+    frais = models.DecimalField(max_digits=10, decimal_places=2, default=0, validators=[MinValueValidator(0)])
+    frais_a_charge = models.CharField(max_length=10, choices=FraisLivraisonACharge.choices,
+                                      default=FraisLivraisonACharge.CLIENT)
+    # Ce que la boutique doit au livreur pour cette course (0 pour un
+    # livreur salarié) : due dès que la livraison est faite.
+    remuneration_livreur = models.DecimalField(max_digits=10, decimal_places=2, default=0,
+                                               validators=[MinValueValidator(0)])
+    # Paiement à la livraison : montant que le livreur doit rapporter.
+    paiement_a_la_livraison = models.BooleanField(default=False)
+    montant_a_encaisser = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    encaisse = models.BooleanField(default=False)
+    mode_encaissement = models.CharField(max_length=20, blank=True)
+    session_encaissement = models.ForeignKey(
+        SessionCaisse, on_delete=models.PROTECT, null=True, blank=True, related_name="encaissements_livraison"
+    )
+    date_encaissement = models.DateTimeField(null=True, blank=True)
+    utilisateur = models.ForeignKey(Utilisateur, on_delete=models.PROTECT, related_name="livraisons_creees")
+    date_creation = models.DateTimeField(auto_now_add=True)
+    date_depart = models.DateTimeField(null=True, blank=True)
+    date_fin = models.DateTimeField(null=True, blank=True)
+    motif_echec = models.CharField(max_length=255, blank=True)
+    # Traçabilité : [{"date", "statut", "action", "utilisateur", "detail"}...]
+    historique = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        ordering = ["-date_creation"]
+        indexes = [models.Index(fields=["statut"]), models.Index(fields=["date_creation"])]
+
+    def __str__(self):
+        return f"Livraison vente #{self.vente_id} ({self.statut})"
+
+
+class PaiementLivreur(models.Model):
+    livreur = models.ForeignKey(Livreur, on_delete=models.PROTECT, related_name="paiements")
+    montant = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))])
+    mode_paiement = models.CharField(max_length=20, default="especes")
+    date_paiement = models.DateField()
+    commentaire = models.CharField(max_length=255, blank=True)
+    utilisateur = models.ForeignKey(Utilisateur, on_delete=models.PROTECT)
+    date_heure = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-date_paiement", "-pk"]
+
+    def __str__(self):
+        return f"{self.livreur} - {self.montant} F"

@@ -941,3 +941,127 @@ class DonneesDeTestCatalogueExistantTests(TestCase):
             self.assertFalse(modele.objects.exists(), modele.__name__)
         self.assertTrue(User.objects.filter(username="souki").exists())
         self.assertFalse(User.objects.filter(username__startswith="test_").exists())
+
+
+# ============================================================
+# Livraisons : vente livrée, frais, paiement à la livraison,
+# traçabilité et rémunération des livreurs
+# ============================================================
+
+from .models import Livreur, Livraison
+
+
+class LivraisonTests(BaseTest):
+    def setUp(self):
+        super().setUp()
+        self.moto = Livreur.objects.create(nom="Modou", telephone="770000021", type_livreur="externe",
+                                           remuneration_par_course=D("1000"))
+        self.interne = Livreur.objects.create(nom="Babacar", telephone="780000013", type_livreur="interne")
+
+    def vendre_livree(self, mode="especes", frais="1000", a_charge="client", livreur=None, attendu=201):
+        livraison = {"adresse": "Rue 10, Médina", "frais": frais, "frais_a_charge": a_charge}
+        if livreur:
+            livraison["livreur"] = livreur.id
+        return self.vendre(self.api_caissier, [{"produit": self.riz.id, "quantite": 2}], attendu=attendu,
+                           mode_paiement=mode, client=self.client_awa.id, livraison=livraison)
+
+    def action(self, livraison_id, action, donnees=None, api=None, attendu=200):
+        r = (api or self.api_caissier).post(f"/api/livraisons/{livraison_id}/{action}/", donnees or {}, format="json")
+        self.assertEqual(r.status_code, attendu, r.data)
+        return r.data
+
+    def test_frais_client_ajoutes_au_total_et_courseur_remunere(self):
+        self.ouvrir_session(self.api_caissier)
+        vente = self.vendre_livree(livreur=self.moto)
+        self.assertEqual(D(vente["montant_total"]), D("3000"))
+        self.assertEqual(vente["livraison"]["statut"], "en_attente")
+        livraison = Livraison.objects.get()
+        self.assertEqual(livraison.remuneration_livreur, D("1000"))
+        self.assertEqual(livraison.contact_telephone, "770000100")
+        self.assertEqual(len(livraison.historique), 1)
+
+    def test_frais_a_la_charge_de_la_boutique_hors_ticket(self):
+        self.ouvrir_session(self.api_caissier)
+        vente = self.vendre_livree(a_charge="boutique", livreur=self.interne)
+        self.assertEqual(D(vente["montant_total"]), D("2000"))
+        self.assertEqual(Livraison.objects.get().remuneration_livreur, D("0"))
+
+    def test_paiement_a_la_livraison_exige_une_livraison(self):
+        self.ouvrir_session(self.api_caissier)
+        self.vendre(self.api_caissier, [{"produit": self.riz.id, "quantite": 1}], attendu=400, mode_paiement="livraison")
+
+    def test_parcours_complet_paiement_a_la_livraison(self):
+        self.ouvrir_session(self.api_caissier, fond="5000")
+        vente = self.vendre_livree(mode="livraison")
+        lid = vente["livraison"]["id"]
+        caisse = self.api_caissier.get("/api/sessions-caisse/courante/").data
+        self.assertEqual(D(caisse["montant_attendu"]), D("5000"))  # rien d'encaissé au départ
+
+        self.action(lid, "depart", attendu=400)  # pas de livreur
+        self.action(lid, "assigner", {"livreur": self.moto.id})
+        self.action(lid, "encaisser", attendu=400)  # pas encore livrée
+        self.action(lid, "depart")
+        self.action(lid, "livree")
+        data = self.action(lid, "encaisser", {"mode_paiement": "especes"})
+        self.assertTrue(data["encaisse"])
+        self.action(lid, "encaisser", attendu=400)  # pas deux fois
+        self.assertEqual([h["action"] for h in data["historique"]][-1], "Argent remis en caisse")
+        self.assertEqual(len(data["historique"]), 5)
+
+        caisse = self.api_caissier.get("/api/sessions-caisse/courante/").data
+        self.assertEqual(D(caisse["livraisons_especes"]), D("3000"))
+        self.assertEqual(D(caisse["montant_attendu"]), D("8000"))
+
+    def test_echec_exige_un_motif(self):
+        self.ouvrir_session(self.api_caissier)
+        lid = self.vendre_livree(livreur=self.moto)["livraison"]["id"]
+        self.action(lid, "echec", attendu=400)
+        data = self.action(lid, "echec", {"motif": "Client absent"})
+        self.assertEqual(data["statut"], "echouee")
+        self.action(lid, "livree", attendu=400)
+
+    def test_solde_du_et_paiement_du_livreur(self):
+        self.ouvrir_session(self.api_caissier)
+        for _ in range(2):
+            lid = self.vendre_livree(livreur=self.moto)["livraison"]["id"]
+            self.action(lid, "livree")
+        livreur = self.api_admin.get(f"/api/livreurs/{self.moto.id}/").data
+        self.assertEqual(D(livreur["solde_du"]), D("2000"))
+        payer = {"livreur": self.moto.id, "montant": "2500", "mode_paiement": "especes", "date_paiement": "2026-10-19"}
+        self.assertEqual(self.api_admin.post("/api/paiements-livreurs/", payer, format="json").status_code, 400)
+        payer["montant"] = "1500"
+        self.assertEqual(self.api_admin.post("/api/paiements-livreurs/", payer, format="json").status_code, 201)
+        self.assertEqual(D(self.api_admin.get(f"/api/livreurs/{self.moto.id}/").data["solde_du"]), D("500"))
+        # Le caissier voit les livreurs mais ne les paie pas.
+        self.assertEqual(self.api_caissier.get("/api/livreurs/").status_code, 200)
+        self.assertEqual(self.api_caissier.post("/api/paiements-livreurs/", payer, format="json").status_code, 403)
+
+    def test_rapport_compte_frais_et_cout_livreur(self):
+        self.ouvrir_session(self.api_caissier)
+        lid = self.vendre_livree(livreur=self.moto)["livraison"]["id"]
+        self.action(lid, "livree")
+        jour = timezone.localdate().isoformat()
+        r = self.api_admin.get(f"/api/rapports/?date={jour}").data
+        # Marge produits 2 x 400 = 800, + 1000 de frais, - 1000 pour le livreur.
+        self.assertEqual(D(r["marge_brute_ventes"]), D("1800"))
+        self.assertEqual(D(r["cout_livraisons"]), D("1000"))
+        self.assertEqual(D(r["resultat_net"]), D("800"))
+
+    def test_annulation_de_la_vente_annule_la_livraison(self):
+        self.ouvrir_session(self.api_caissier)
+        self.ouvrir_session(self.api_admin)
+        vente = self.vendre_livree(mode="livraison", livreur=self.moto)
+        r = self.api_admin.post(f"/api/ventes/{vente['id']}/annuler/", format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(Livraison.objects.get().statut, "annulee")
+        self.action(vente["livraison"]["id"], "depart", attendu=400)
+
+    def test_liste_filtree_par_statut(self):
+        self.ouvrir_session(self.api_caissier)
+        lid = self.vendre_livree(livreur=self.moto)["livraison"]["id"]
+        self.vendre_livree()
+        self.action(lid, "livree")
+        r = self.api_caissier.get("/api/livraisons/?statut=en_attente,en_cours")
+        self.assertEqual(r.status_code, 200)
+        donnees = r.data["results"] if isinstance(r.data, dict) else r.data
+        self.assertEqual(len(donnees), 1)
