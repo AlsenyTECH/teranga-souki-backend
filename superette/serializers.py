@@ -561,6 +561,11 @@ class TransactionCaisseLectureSerializer(serializers.ModelSerializer):
         # l'objet n'est pas relu depuis la base) — quantize() ici évite
         # de propager ce bruit de précision dans un champ affiché tel quel.
         total = obj.montant_total + self.get_reduction_montant(obj)
+        # Sous-total = articles seuls : les frais de livraison payés par le
+        # client sont dans montant_total mais pas dans les articles.
+        livraison = getattr(obj, "livraison", None)
+        if livraison is not None and livraison.frais_a_charge == "client":
+            total -= livraison.frais
         return total.quantize(Decimal("0.01"))
 
 

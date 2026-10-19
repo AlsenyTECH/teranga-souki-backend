@@ -974,6 +974,7 @@ class LivraisonTests(BaseTest):
         self.ouvrir_session(self.api_caissier)
         vente = self.vendre_livree(livreur=self.moto)
         self.assertEqual(D(vente["montant_total"]), D("3000"))
+        self.assertEqual(D(vente["sous_total"]), D("2000"))
         self.assertEqual(vente["livraison"]["statut"], "en_attente")
         livraison = Livraison.objects.get()
         self.assertEqual(livraison.remuneration_livreur, D("1000"))
