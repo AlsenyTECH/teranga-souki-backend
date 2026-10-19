@@ -1057,6 +1057,25 @@ class LivraisonTests(BaseTest):
         self.assertEqual(Livraison.objects.get().statut, "annulee")
         self.action(vente["livraison"]["id"], "depart", attendu=400)
 
+    def test_prix_de_la_course_modifiable_par_livraison(self):
+        self.ouvrir_session(self.api_caissier)
+        # Saisi en caisse pour cette course, différent du tarif habituel (1000 F).
+        vente = self.vendre_livree(livreur=self.moto)
+        livraison = Livraison.objects.get(pk=vente["livraison"]["id"])
+        self.assertEqual(livraison.remuneration_livreur, D("1000"))
+        self.ouvrir_session(self.api_admin)
+        vente2 = self.vendre(self.api_admin, [{"produit": self.riz.id, "quantite": 1}], client=self.client_awa.id,
+                             livraison={"adresse": "Ouakam", "frais": "2000", "livreur": self.moto.id,
+                                        "remuneration_livreur": "1500"})
+        self.assertEqual(Livraison.objects.get(pk=vente2["livraison"]["id"]).remuneration_livreur, D("1500"))
+        # Corrigé après coup par l'admin ; le caissier ne peut pas.
+        url = f"/api/livraisons/{livraison.id}/"
+        self.assertEqual(self.api_caissier.patch(url, {"remuneration_livreur": "0"}, format="json").status_code, 403)
+        r = self.api_admin.patch(url, {"remuneration_livreur": "1200"}, format="json")
+        self.assertEqual(r.status_code, 200, r.data)
+        self.assertEqual(D(r.data["remuneration_livreur"]), D("1200"))
+        self.assertIn("1200", r.data["historique"][-1]["detail"])
+
     def test_liste_filtree_par_statut(self):
         self.ouvrir_session(self.api_caissier)
         lid = self.vendre_livree(livreur=self.moto)["livraison"]["id"]
