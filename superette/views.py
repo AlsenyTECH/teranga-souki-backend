@@ -296,8 +296,8 @@ from datetime import date as date_cls, timedelta
 from django.db.models import Sum, F, DecimalField, ExpressionWrapper
 from django.db.models.functions import Coalesce, TruncDate
 from django.db import transaction
-from decimal import Decimal
-from rest_framework.exceptions import ValidationError
+from decimal import Decimal, InvalidOperation
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from .models import (
     LigneVente, Depense as DepenseModel, AjustementStock, ModePaiement,
     RetourVente, LigneRetour, VenteProduits, PaiementVente,
@@ -1583,6 +1583,19 @@ class LivraisonDetailView(APIView):
             setattr(livraison, c, str(request.data[c])[:255])
         if not livraison.adresse:
             raise ValidationError({"adresse": "L'adresse est obligatoire."})
+        # Le prix d'une course n'est jamais figé : l'admin peut le corriger,
+        # même après la livraison (le solde dû au livreur suit).
+        if "remuneration_livreur" in request.data:
+            if request.user.utilisateur.role_id != "admin":
+                raise PermissionDenied("Seul un admin peut modifier la rémunération du livreur.")
+            try:
+                remuneration = Decimal(str(request.data["remuneration_livreur"])).quantize(Decimal("0.01"))
+            except (InvalidOperation, ValueError):
+                raise ValidationError({"remuneration_livreur": "Montant invalide."})
+            if remuneration < 0:
+                raise ValidationError({"remuneration_livreur": "Le montant ne peut pas être négatif."})
+            champs.append(f"rémunération {livraison.remuneration_livreur:.0f} F → {remuneration:.0f} F")
+            livraison.remuneration_livreur = remuneration
         if champs:
             ajouter_historique(livraison, "Informations modifiées", request.user.utilisateur, ", ".join(champs))
             livraison.save()
