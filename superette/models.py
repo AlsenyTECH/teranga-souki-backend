@@ -776,7 +776,7 @@ class StatutLivraison(models.TextChoices):
 
 class FraisLivraisonACharge(models.TextChoices):
     CLIENT = "client", "Payés par le client"
-    BOUTIQUE = "boutique", "Offerts par Teranga Souki"
+    BOUTIQUE = "boutique", "Offerts par Teranga Épicerie"
 
 
 class Livraison(NumeroteMixin):
