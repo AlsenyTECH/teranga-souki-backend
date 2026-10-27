@@ -69,7 +69,7 @@ class ProduitSerializer(serializers.ModelSerializer):
     class Meta:
         model = Produit
         fields = [
-            "id", "nom", "code_barre", "prix_achat_moyen", "prix_vente",
+            "id", "nom", "marque", "code_barre", "prix_achat_moyen", "prix_vente",
             "prix_vente_gros", "seuil_gros",
             "unite_vente", "quantite_stock", "seuil_alerte", "categorie", "categorie_nom",
             "actif", "stock_bas", "date_peremption",
@@ -390,7 +390,7 @@ class VenteCreationSerializer(serializers.Serializer):
                     # aucune ligne déjà traitée avant celle-ci ne sera
                     # sauvegardée. C'est exactement le comportement voulu.
                     raise serializers.ValidationError(
-                        f"Stock insuffisant pour {produit.nom} "
+                        f"Stock insuffisant pour {produit} "
                         f"(disponible: {produit.quantite_stock}, demandé: {ligne['quantite']})"
                     )
 
@@ -518,7 +518,7 @@ class TransactionCaisseLectureSerializer(serializers.ModelSerializer):
     class Meta:
         model = TransactionCaisse
         fields = [
-            "id", "date_heure", "montant_total", "mode_paiement",
+            "id", "numero", "date_heure", "montant_total", "mode_paiement",
             "caissier_nom", "client_nom", "client_telephone", "client_adresse", "annulee", "lignes",
             "reduction_montant", "sous_total", "montant_retourne", "montant_net", "paiements",
             "date_annulation", "montant_annulation_especes", "livraison",
@@ -529,7 +529,7 @@ class TransactionCaisseLectureSerializer(serializers.ModelSerializer):
         if livraison is None:
             return None
         return {
-            "id": livraison.id, "statut": livraison.statut, "adresse": livraison.adresse,
+            "id": livraison.id, "numero": livraison.numero, "statut": livraison.statut, "adresse": livraison.adresse,
             "contact_nom": livraison.contact_nom, "contact_telephone": livraison.contact_telephone,
             "frais": livraison.frais, "frais_a_charge": livraison.frais_a_charge,
             "livreur_nom": livraison.livreur.nom if livraison.livreur else None,
@@ -743,7 +743,7 @@ class RetourVenteLectureSerializer(serializers.ModelSerializer):
     class Meta:
         model = RetourVente
         fields = [
-            "id", "vente", "session_caisse", "utilisateur_nom", "date_heure",
+            "id", "numero", "vente", "session_caisse", "utilisateur_nom", "date_heure",
             "montant_total", "affecte_caisse", "commentaire",
         ]
 
@@ -927,7 +927,7 @@ def verifier_appro_modifiable(appro):
         )
         if plus_recente_appro or vente_posterieure or ajustement_posterieur or retour_posterieur:
             raise serializers.ValidationError(
-                f"« {produit.nom} » a bougé depuis cette réception (vente, ajustement ou "
+                f"« {produit} » a bougé depuis cette réception (vente, ajustement ou "
                 "autre réception plus récente) — impossible de la modifier ou de la supprimer."
             )
 
@@ -1162,7 +1162,7 @@ class RetourApproCreationSerializer(serializers.Serializer):
                 # renvoie jamais plus que ce qui est réellement en rayon.
                 if produit.quantite_stock < quantite:
                     raise serializers.ValidationError(
-                        f"Stock insuffisant pour renvoyer {quantite} de {produit.nom} "
+                        f"Stock insuffisant pour renvoyer {quantite} de {produit} "
                         f"(en stock : {produit.quantite_stock})."
                     )
                 # Le stock diminue (la marchandise repart chez le
@@ -1191,7 +1191,7 @@ class RetourApproLectureSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = RetourAppro
-        fields = ["id", "appro", "utilisateur_nom", "date_heure", "montant_total", "commentaire"]
+        fields = ["id", "numero", "appro", "utilisateur_nom", "date_heure", "montant_total", "commentaire"]
 
 
 class ApprovisionnementLectureSerializer(serializers.ModelSerializer):
@@ -1202,7 +1202,7 @@ class ApprovisionnementLectureSerializer(serializers.ModelSerializer):
     class Meta:
         model = Approvisionnement
         fields = [
-            "id", "date_reception", "fournisseur", "fournisseur_nom", "numero_facture", "lignes",
+            "id", "numero", "date_reception", "fournisseur", "fournisseur_nom", "numero_facture", "lignes",
             "montant_total", "mode_paiement", "montant_paye", "annulee", "retours",
         ]
 
@@ -1697,7 +1697,7 @@ from .models import Inventaire, LigneInventaire, StatutInventaire, Employe, Paie
 
 
 class LigneInventaireLectureSerializer(serializers.ModelSerializer):
-    produit_nom = serializers.CharField(source="produit.nom", read_only=True)
+    produit_nom = serializers.StringRelatedField(source="produit", read_only=True)
     produit_unite_vente = serializers.CharField(source="produit.unite_vente", read_only=True)
     categorie_nom = serializers.CharField(source="produit.categorie.libelle", read_only=True)
     stock_theorique = serializers.SerializerMethodField()
@@ -1765,7 +1765,7 @@ class LigneInventaireEcritureSerializer(serializers.Serializer):
         produit = data["produit"]
         q = data["quantite_comptee"]
         if produit.unite_vente == "unite" and q != q.to_integral_value():
-            raise serializers.ValidationError(f"{produit.nom} se vend à l'unité : la quantité comptée doit être entière.")
+            raise serializers.ValidationError(f"{produit} se vend à l'unité : la quantité comptée doit être entière.")
         return data
 
 
@@ -1943,7 +1943,7 @@ class LivraisonSerializer(serializers.ModelSerializer):
     class Meta:
         model = Livraison
         fields = [
-            "id", "vente", "statut", "livreur", "livreur_nom", "livreur_telephone", "adresse", "contact_nom",
+            "id", "numero", "vente", "statut", "livreur", "livreur_nom", "livreur_telephone", "adresse", "contact_nom",
             "contact_telephone", "instructions", "frais", "frais_a_charge", "remuneration_livreur",
             "paiement_a_la_livraison", "montant_a_encaisser", "encaisse", "mode_encaissement", "date_encaissement",
             "utilisateur_nom", "date_creation", "date_depart", "date_fin", "motif_echec", "historique",
