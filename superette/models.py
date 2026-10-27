@@ -66,6 +66,9 @@ class UniteVente(models.TextChoices):
 
 class Produit(models.Model):
     nom = models.CharField(max_length=150)
+    # Marque (Dinor, Jumbo, Vitalait...) : plusieurs produits peuvent
+    # porter le même nom avec des marques différentes.
+    marque = models.CharField(max_length=80, blank=True, default="")
     code_barre = models.CharField(max_length=50, unique=True, blank=True, null=True)
     # DecimalField, jamais FloatField, pour l'argent (rappel chapitre 4) :
     # max_digits=10, decimal_places=2 -> équivalent exact de DECIMAL(10,2)
@@ -109,7 +112,9 @@ class Produit(models.Model):
     date_peremption = models.DateField(null=True, blank=True)
 
     def __str__(self):
-        return self.nom
+        # Nom affiché partout (tickets, factures, rapports) : la marque
+        # distingue deux produits de même nom.
+        return f"{self.nom} · {self.marque}" if self.marque else self.nom
 
     def stock_bas(self):
         # Méthode "métier" simple, directement utilisable dans les vues/rapports
@@ -206,9 +211,72 @@ class ModePaiement(models.TextChoices):
     LIVRAISON = "livraison", "À encaisser à la livraison"
 
 
-class TransactionCaisse(models.Model):
+# ============================================================
+# Numérotation automatique des documents : chaque facture reçoit un
+# numéro lisible, unique et continu par type et par année
+# (FV-2026-00042), attribué par l'app à la création — jamais saisi.
+# ============================================================
+
+class CompteurDocument(models.Model):
+    prefixe = models.CharField(max_length=4)
+    annee = models.PositiveIntegerField()
+    dernier = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        unique_together = [("prefixe", "annee")]
+
+
+def prochain_numero(prefixe, annee):
+    """Réserve le numéro suivant. Le verrou de ligne (select_for_update)
+    garantit qu'aucun numéro n'est donné deux fois, même si deux caisses
+    valident au même instant."""
+    from django.db import transaction
+    with transaction.atomic():
+        compteur, _ = CompteurDocument.objects.select_for_update().get_or_create(prefixe=prefixe, annee=annee)
+        compteur.dernier += 1
+        compteur.save(update_fields=["dernier"])
+        return f"{prefixe}-{annee}-{compteur.dernier:05d}"
+
+
+def recaler_compteurs():
+    """Remet chaque compteur au plus grand numéro encore en base (après
+    effacement de données de test) : la numérotation continue sans trou
+    à partir des vraies factures."""
+    derniers = {}
+    for modele in NumeroteMixin.__subclasses__():
+        for numero in modele.objects.exclude(numero__isnull=True).values_list("numero", flat=True):
+            prefixe, annee, rang = numero.split("-")
+            cle = (prefixe, int(annee))
+            derniers[cle] = max(derniers.get(cle, 0), int(rang))
+    CompteurDocument.objects.all().delete()
+    CompteurDocument.objects.bulk_create(
+        [CompteurDocument(prefixe=p, annee=a, dernier=d) for (p, a), d in derniers.items()]
+    )
+
+
+class NumeroteMixin(models.Model):
+    """Donne un numéro de document à la première sauvegarde.
+    PREFIXE_NUMERO : FV (facture de vente), BR (bon de réception),
+    AV (avoir / retour client), RF (retour fournisseur), BL (bon de livraison)."""
+    PREFIXE_NUMERO = ""
+    numero = models.CharField(max_length=20, unique=True, null=True, blank=True, editable=False)
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        if not self.numero:
+            from django.utils import timezone
+            self.numero = prochain_numero(self.PREFIXE_NUMERO, timezone.localdate().year)
+            if kwargs.get("update_fields") is not None:
+                kwargs["update_fields"] = [*kwargs["update_fields"], "numero"]
+        super().save(*args, **kwargs)
+
+
+class TransactionCaisse(NumeroteMixin):
     # Nommée TransactionCaisse (pas "Transaction") pour éviter toute
     # confusion avec les transactions de base de données de Django
+    PREFIXE_NUMERO = "FV"
     date_heure = models.DateTimeField(auto_now_add=True)
     montant_total = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
     mode_paiement = models.CharField(max_length=20, choices=ModePaiement.choices)
@@ -295,7 +363,8 @@ class LigneVente(models.Model):
 # "net" se calcule à la lecture (montant_total - Σ retours).
 # ============================================================
 
-class RetourVente(models.Model):
+class RetourVente(NumeroteMixin):
+    PREFIXE_NUMERO = "AV"
     vente = models.ForeignKey(TransactionCaisse, on_delete=models.PROTECT, related_name="retours")
     # Toujours la session OUVERTE de la personne qui fait le retour —
     # jamais celle de la vente d'origine : l'argent sort de la caisse
@@ -335,14 +404,13 @@ class ModePaiementAppro(models.TextChoices):
     CREDIT = "credit", "Crédit fournisseur"
 
 
-class Approvisionnement(models.Model):
+class Approvisionnement(NumeroteMixin):
+    PREFIXE_NUMERO = "BR"
     date_reception = models.DateTimeField(auto_now_add=True)
     fournisseur = models.ForeignKey(Fournisseur, on_delete=models.PROTECT)
-    # Numéro de la facture papier/PDF fournie par le fournisseur — pas
-    # généré par le système, c'est une référence externe qu'on note
-    # pour pouvoir rapprocher notre enregistrement du document réel en
-    # cas de contrôle ou de litige. Optionnel : certains petits
-    # fournisseurs informels n'émettent pas toujours de facture numérotée.
+    # Ancienne référence de la facture du fournisseur, saisie à la main.
+    # Le numéro du document est désormais généré par l'app (`numero`) ;
+    # ce champ reste pour l'historique et n'est plus demandé.
     numero_facture = models.CharField(max_length=50, blank=True)
     # NOUVEAU : jusqu'ici jamais stocké, uniquement recalculé à la volée
     # côté Flutter à partir des lignes — indispensable maintenant pour
@@ -388,7 +456,7 @@ class LigneAppro(models.Model):
         return f"{self.quantite_recue} x {self.produit}"
 
 
-class RetourAppro(models.Model):
+class RetourAppro(NumeroteMixin):
     """
     Retour (partiel) de marchandise à un fournisseur — miroir de
     RetourVente côté achats : la réception d'origine reste intacte,
@@ -396,6 +464,7 @@ class RetourAppro(models.Model):
     pas de notion de caisse/espèces ici : le retour réduit uniquement
     le stock et, au prorata, la dette envers ce fournisseur.
     """
+    PREFIXE_NUMERO = "RF"
     appro = models.ForeignKey(Approvisionnement, on_delete=models.PROTECT, related_name="retours")
     utilisateur = models.ForeignKey(Utilisateur, on_delete=models.PROTECT)
     date_heure = models.DateTimeField(auto_now_add=True)
@@ -707,10 +776,11 @@ class StatutLivraison(models.TextChoices):
 
 class FraisLivraisonACharge(models.TextChoices):
     CLIENT = "client", "Payés par le client"
-    BOUTIQUE = "boutique", "Offerts par Teranga Souki"
+    BOUTIQUE = "boutique", "Offerts par Teranga Épicerie"
 
 
-class Livraison(models.Model):
+class Livraison(NumeroteMixin):
+    PREFIXE_NUMERO = "BL"
     vente = models.OneToOneField(TransactionCaisse, on_delete=models.PROTECT, related_name="livraison")
     livreur = models.ForeignKey(Livreur, on_delete=models.PROTECT, null=True, blank=True, related_name="livraisons")
     statut = models.CharField(max_length=12, choices=StatutLivraison.choices, default=StatutLivraison.EN_ATTENTE)

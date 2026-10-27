@@ -29,7 +29,7 @@ from superette.models import (
 
 
 class Command(BaseCommand):
-    help = "Remplit la base avec des données de démonstration pour Teranga Souki."
+    help = "Remplit la base avec des données de démonstration pour Teranga Épicerie."
 
     def add_arguments(self, parser):
         parser.add_argument(

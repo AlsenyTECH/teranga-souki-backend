@@ -180,6 +180,11 @@ class VenteView(APIView):
             voit_client = client_id and "clients" in (utilisateur.permissions_supplementaires or [])
             if not voit_client:
                 qs = qs.filter(utilisateur=utilisateur)
+        # ?numero=FV-2026-00042 (ou une partie) : retrouver une facture
+        # précise, quelle que soit sa date.
+        numero = request.query_params.get("numero", "").strip()
+        if numero:
+            return reponse_liste(request, self, qs.filter(numero__icontains=numero), TransactionCaisseLectureSerializer)
         qs = filtrer_par_dates(qs, request, "date_heure")
         return reponse_liste(request, self, qs, TransactionCaisseLectureSerializer)
 
@@ -213,6 +218,11 @@ class ApprovisionnementView(APIView):
         fournisseur_id = request.query_params.get("fournisseur")
         if fournisseur_id:
             qs = qs.filter(fournisseur_id=fournisseur_id)
+        # ?numero=BR-2026-00012 (ou une partie) : retrouver un bon précis,
+        # quelle que soit sa date.
+        numero = request.query_params.get("numero", "").strip()
+        if numero:
+            return reponse_liste(request, self, qs.filter(numero__icontains=numero), ApprovisionnementLectureSerializer)
         qs = filtrer_par_dates(qs, request, "date_reception")
         return reponse_liste(request, self, qs, ApprovisionnementLectureSerializer)
 

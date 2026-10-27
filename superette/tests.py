@@ -1085,3 +1085,67 @@ class LivraisonTests(BaseTest):
         self.assertEqual(r.status_code, 200)
         donnees = r.data["results"] if isinstance(r.data, dict) else r.data
         self.assertEqual(len(donnees), 1)
+
+
+# ============================================================
+# Numéros de facture générés par l'app, et marques des produits
+# ============================================================
+
+class NumerotationTests(BaseTest):
+    def test_ventes_numerotees_dans_l_ordre(self):
+        self.ouvrir_session(self.api_caissier)
+        annee = timezone.localdate().year
+        v1 = self.vendre(self.api_caissier, [{"produit": self.riz.id, "quantite": 1}])
+        v2 = self.vendre(self.api_caissier, [{"produit": self.huile.id, "quantite": 1}])
+        self.assertEqual(v1["numero"], f"FV-{annee}-00001")
+        self.assertEqual(v2["numero"], f"FV-{annee}-00002")
+        # Recherche par numéro (même partiel), sans filtre de date.
+        r = self.api_caissier.get("/api/ventes/?numero=00002")
+        self.assertEqual([v["id"] for v in r.data], [v2["id"]])
+
+    def test_reception_numerotee_sans_saisie(self):
+        fournisseur = Fournisseur.objects.create(nom="Grossiste Sandaga")
+        r = self.api_admin.post("/api/approvisionnements/", {
+            "fournisseur": fournisseur.id,
+            "lignes": [{"produit": self.riz.id, "quantite_recue": "10", "prix_unitaire_achat": "600"}],
+        }, format="json")
+        self.assertEqual(r.status_code, 201, r.data)
+        self.assertEqual(r.data["numero"], f"BR-{timezone.localdate().year}-00001")
+
+    def test_numero_attribue_une_seule_fois(self):
+        self.ouvrir_session(self.api_caissier)
+        vente = TransactionCaisse.objects.get(pk=self.vendre(self.api_caissier, [{"produit": self.riz.id, "quantite": 1}])["id"])
+        numero = vente.numero
+        vente.annulee = True
+        vente.save(update_fields=["annulee"])
+        vente.refresh_from_db()
+        self.assertEqual(vente.numero, numero)
+
+
+class RecalageCompteursTests(BaseTest):
+    def test_les_numeros_reprennent_apres_effacement(self):
+        from .models import recaler_compteurs
+        self.ouvrir_session(self.api_caissier)
+        annee = timezone.localdate().year
+        ventes = [self.vendre(self.api_caissier, [{"produit": self.riz.id, "quantite": 1}]) for _ in range(3)]
+        # Les deux dernières (données de test) sont effacées.
+        TransactionCaisse.objects.filter(pk__in=[v["id"] for v in ventes[1:]]).delete()
+        recaler_compteurs()
+        suivante = self.vendre(self.api_caissier, [{"produit": self.riz.id, "quantite": 1}])
+        self.assertEqual(suivante["numero"], f"FV-{annee}-00002")
+
+
+class MarqueProduitTests(BaseTest):
+    def test_meme_nom_marques_differentes(self):
+        for marque in ("Dinor", "Niinal"):
+            r = self.api_admin.post("/api/produits/", {
+                "nom": "Huile 1 L", "marque": marque, "prix_vente": "1500", "categorie": self.categorie.id,
+            }, format="json")
+            self.assertEqual(r.status_code, 201, r.data)
+            self.assertEqual(r.data["marque"], marque)
+        dinor = Produit.objects.get(marque="Dinor")
+        Produit.objects.filter(pk=dinor.pk).update(quantite_stock=D("5"))
+        self.ouvrir_session(self.api_caissier)
+        vente = self.vendre(self.api_caissier, [{"produit": dinor.id, "quantite": 1}])
+        # La marque apparaît sur le ticket.
+        self.assertEqual(vente["lignes"][0]["produit_nom"], "Huile 1 L · Dinor")

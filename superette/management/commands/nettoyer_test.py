@@ -30,6 +30,7 @@ from superette.models import (
     PaiementVente, Produit, RemboursementCredit, RetourAppro, RetourVente,
     SessionCaisse, TransactionCaisse, Utilisateur, VenteProduits,
     Inventaire, LigneInventaire, Employe, PaiementSalaire, Livraison, Livreur, PaiementLivreur,
+    recaler_compteurs,
 )
 
 PREFIXE_COMPTE = "test_"
@@ -102,6 +103,7 @@ class Command(BaseCommand):
             # Le profil Utilisateur (et les jetons) partent avec le compte (CASCADE).
             User.objects.filter(username__startswith=PREFIXE_COMPTE).delete()
             InstantaneDonneesTest.objects.all().delete()
+            recaler_compteurs()
 
         self.stdout.write(self.style.SUCCESS(
             "Base nettoyée.\n  " + ("\n  ".join(bilan) or "aucune donnée métier") +
@@ -152,6 +154,7 @@ class Command(BaseCommand):
             n_comptes = User.objects.filter(username__startswith=PREFIXE_COMPTE).count()
             User.objects.filter(username__startswith=PREFIXE_COMPTE).delete()
             InstantaneDonneesTest.objects.all().delete()
+            recaler_compteurs()
 
         self.stdout.write(self.style.SUCCESS(
             f"Données de test effacées (instantané du {instantane.date_creation:%d/%m/%Y %H:%M}).\n  "
